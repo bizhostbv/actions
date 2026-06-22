@@ -45,7 +45,10 @@ jobs:
           echo "image=$REG/${{ inputs.project }}/${{ inputs.app }}:$v" >> "$GITHUB_OUTPUT"
 
       - name: Harbor login
-        run: buildah login -u "${{ secrets.harbor_username }}" --password-stdin "${{ steps.ver.outputs.registry }}" <<< "${{ secrets.harbor_token }}"
+        env:
+          HARBOR_USER: ${{ secrets.harbor_username }}    # via env so the shell does not re-expand the '$' in robot$name
+          HARBOR_TOKEN: ${{ secrets.harbor_token }}
+        run: printf '%s' "$HARBOR_TOKEN" | buildah login -u "$HARBOR_USER" --password-stdin "${{ steps.ver.outputs.registry }}"
 
       - name: Guard — version must not already exist (immutable, no reuse)
         run: |
