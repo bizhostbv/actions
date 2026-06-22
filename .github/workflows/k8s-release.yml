@@ -1,16 +1,21 @@
 name: k8s-release
-# Reusable, immutable build+push for any container app on K8s.
-# Caller triggers on push to release/vX.Y.Z; we build one immutable :X.Y.Z and push it.
-# ArgoCD Image Updater (cluster-side) detects the new tag and rolls the environment.
+# Reusable immutable release pipeline for any container app on K8s.
+# Caller triggers on push to release/vX.Y.Z. Build one immutable :X.Y.Z, push it,
+# then write that tag into the GitOps repo (acc) so ArgoCD auto-syncs. No moving tags.
 on:
   workflow_call:
     inputs:
-      project:    { required: true,  type: string }   # Harbor project
-      app:        { required: true,  type: string }   # image/app name
-      dockerfile: { required: false, type: string, default: Dockerfile }
-      context:    { required: false, type: string, default: . }
-      build_args: { required: false, type: string, default: '' }   # space-separated KEY=VALUE pairs
-      registry:   { required: false, type: string, default: '' }   # override; else uses vars.HARBOR_REGISTRY (acc/prod differ)
+      project:     { required: true,  type: string }   # Harbor project
+      app:         { required: true,  type: string }   # image/app name
+      dockerfile:  { required: false, type: string, default: Dockerfile }
+      context:     { required: false, type: string, default: . }
+      build_args:  { required: false, type: string, default: '' }   # space-separated KEY=VALUE pairs
+      registry:    { required: false, type: string, default: '' }   # override; else vars.HARBOR_REGISTRY (acc/prod differ)
+      gitops_repo: { required: false, type: string, default: 'git@github.com:bizhostbv/k8s-hotel-cluster-gitops.git' }
+      values_file: { required: false, type: string, default: '' }   # override; else values/acc/<app>.yaml
+      tag_key:     { required: false, type: string, default: '.image.tag' }   # yq path to the image tag to set
+    secrets:
+      gitops_deploy_key: { required: true }
 
 concurrency:
   group: release-${{ github.repository }}   # github.repository = the CALLER repo
@@ -22,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Derive & validate version from branch
+      - name: Derive & validate version + resolve registry
         id: ver
         run: |
           set -euo pipefail
@@ -52,5 +57,28 @@ jobs:
             -f "${{ inputs.dockerfile }}" -t "${{ steps.ver.outputs.image }}" "${{ inputs.context }}"
           buildah push "${{ steps.ver.outputs.image }}"
 
+      - name: Write immutable tag into GitOps (acc) — race-safe
+        env:
+          GIT_SSH_COMMAND: ssh -i /tmp/gitops-ci -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new
+        run: |
+          set -euo pipefail
+          install -m600 /dev/stdin /tmp/gitops-ci <<< "${{ secrets.gitops_deploy_key }}"
+          VF="${{ inputs.values_file }}"; [ -z "$VF" ] && VF="values/acc/${{ inputs.app }}.yaml"
+          rm -rf /tmp/gitops && git clone --quiet "${{ inputs.gitops_repo }}" /tmp/gitops
+          cd /tmp/gitops
+          git config user.name 'gitops-ci'; git config user.email 'gitops-ci@k8s-hotel'
+          pushed=0
+          for attempt in 1 2 3 4 5; do
+            git fetch -q origin main
+            git reset --hard -q origin/main
+            yq -i "${{ inputs.tag_key }} = \"${{ steps.ver.outputs.version }}\"" "$VF"
+            if git diff --quiet; then echo "tag already ${{ steps.ver.outputs.version }}"; pushed=1; break; fi
+            git commit -aqm "release(acc/${{ inputs.app }}): ${{ steps.ver.outputs.version }}"
+            if git push -q origin HEAD:main; then echo "pushed on attempt $attempt"; pushed=1; break; fi
+            echo "push race, retry $attempt"; sleep $((RANDOM % 4 + 1))
+          done
+          rm -f /tmp/gitops-ci
+          [ "$pushed" = 1 ] || { echo "::error::Could not write tag to gitops after retries"; exit 1; }
+
       - name: Summary
-        run: echo "Pushed ${{ steps.ver.outputs.image }}. ArgoCD Image Updater rolls the environment." >> "$GITHUB_STEP_SUMMARY"
+        run: echo "Released ${{ steps.ver.outputs.image }} -> acc via gitops (ArgoCD auto-syncs). Promote to prod via reviewed gitops PR." >> "$GITHUB_STEP_SUMMARY"
