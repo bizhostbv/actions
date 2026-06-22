@@ -1,0 +1,133 @@
+name: k8s-release-chart
+# Immutable, chart-aware release. On push to release/vX.Y.Z this builds one immutable
+# image :X.Y.Z AND packages the Helm chart as an immutable OCI artifact vX.Y.Z (the image
+# tag is baked into the chart), pushes both to the acc registry, and bumps the acc ArgoCD
+# Application's chart targetRevision in the gitops repo. acc auto-syncs the new version.
+# Pure-gitops: the running version == the chart version (no moving tags, no mutable branch).
+#
+# Runner prerequisites (pre-stored on the self-hosted host, never GITHUB_TOKEN):
+#   - buildah login <registry>      (image push)
+#   - helm registry login <registry>  (OCI chart push)
+on:
+  workflow_call:
+    inputs:
+      project:     { required: true,  type: string }                                  # Harbor project (e.g. gcg)
+      app:         { required: true,  type: string }                                  # image + chart name (e.g. shop-backend)
+      dockerfile:  { required: false, type: string, default: Dockerfile }
+      context:     { required: false, type: string, default: . }
+      chart_dir:   { required: false, type: string, default: chart }
+      registry:    { required: false, type: string, default: harbor.k8s-hotel.nl }
+      gitops_repo: { required: false, type: string, default: "git@github.com:globalcontrolgroup/gcg-shop-gitops.git" }
+    secrets:
+      gitops_deploy_key: { required: true }
+
+concurrency:
+  group: release-${{ github.repository }}   # one release at a time per app repo
+  cancel-in-progress: false                 # queue releases; never drop one
+
+# Release uses host registry creds + the gitops deploy key, never the GITHUB_TOKEN.
+permissions: {}
+
+jobs:
+  release:
+    runs-on: [self-hosted, harbor-builder]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive & validate version from branch
+        id: ver
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          v="${REF#refs/heads/release/v}"
+          if ! printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Branch must be release/vMAJOR.MINOR.PATCH (got '$REF')"; exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Validate project/app (charset — they land in registry refs and file paths)
+        env:
+          PROJECT: ${{ inputs.project }}
+          APP: ${{ inputs.app }}
+        run: |
+          set -euo pipefail
+          for name in PROJECT APP; do
+            val="${!name}"
+            printf '%s' "$val" | grep -Eq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$' \
+              || { echo "::error::$name must match ^[a-z0-9-]+$ (got '$val')"; exit 1; }
+          done
+
+      - name: Guard — image & chart must not already exist (immutable, no reuse)
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          PROJECT: ${{ inputs.project }}
+          APP: ${{ inputs.app }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          if skopeo inspect "docker://$REGISTRY/$PROJECT/$APP:$VERSION" >/dev/null 2>&1; then
+            echo "::error::image $REGISTRY/$PROJECT/$APP:$VERSION already exists — versions are immutable. Bump the semver."; exit 1
+          fi
+          if skopeo inspect "docker://$REGISTRY/$PROJECT/charts/$APP:$VERSION" >/dev/null 2>&1; then
+            echo "::error::chart $REGISTRY/$PROJECT/charts/$APP:$VERSION already exists — versions are immutable. Bump the semver."; exit 1
+          fi
+
+      - name: Build & push immutable image
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          PROJECT: ${{ inputs.project }}
+          APP: ${{ inputs.app }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          CONTEXT: ${{ inputs.context }}
+        run: |
+          set -euo pipefail
+          IMG="$REGISTRY/$PROJECT/$APP:$VERSION"
+          buildah bud --layers --isolation chroot -f "$DOCKERFILE" -t "$IMG" "$CONTEXT"
+          buildah push "$IMG"   # Harbor creds pre-stored on the host
+
+      - name: Package & push immutable chart (image tag baked in)
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          PROJECT: ${{ inputs.project }}
+          APP: ${{ inputs.app }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          CHART_DIR: ${{ inputs.chart_dir }}
+        run: |
+          set -euo pipefail
+          # Bake the image tag into the chart so the chart version fully determines the
+          # running image. The chart name in Chart.yaml MUST equal "$APP".
+          yq -i ".image.tag = \"$VERSION\"" "$CHART_DIR/values.yaml"
+          rm -rf /tmp/chartpkg && mkdir -p /tmp/chartpkg
+          helm package "$CHART_DIR" --version "$VERSION" --app-version "$VERSION" -d /tmp/chartpkg
+          helm push "/tmp/chartpkg/$APP-$VERSION.tgz" "oci://$REGISTRY/$PROJECT/charts"   # helm registry login pre-stored on host
+
+      - name: Bump acc Application chart targetRevision in gitops (acc auto-syncs)
+        env:
+          GIT_SSH_COMMAND: ssh -i /tmp/gitops-ci -o IdentitiesOnly=yes -o UserKnownHostsFile=/tmp/gitops-known_hosts -o StrictHostKeyChecking=yes
+          VERSION: ${{ steps.ver.outputs.version }}
+          APP: ${{ inputs.app }}
+          GITOPS_REPO: ${{ inputs.gitops_repo }}
+          GITOPS_KEY: ${{ secrets.gitops_deploy_key }}
+        run: |
+          set -euo pipefail
+          trap 'rm -f /tmp/gitops-ci /tmp/gitops-known_hosts' EXIT
+          printf '%s\n' "$GITOPS_KEY" > /tmp/gitops-ci && chmod 600 /tmp/gitops-ci
+          # Pin github.com's published Ed25519 host key instead of TOFU (accept-new),
+          # closing the first-connection MITM window on a push that carries the deploy key.
+          printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > /tmp/gitops-known_hosts
+          rm -rf /tmp/gitops && git clone "$GITOPS_REPO" /tmp/gitops
+          yq -i ".spec.sources[0].targetRevision = \"$VERSION\"" "/tmp/gitops/apps/acc/$APP.yaml"
+          git -C /tmp/gitops config user.name 'gitops-ci'
+          git -C /tmp/gitops config user.email 'gitops-ci@k8s-hotel'
+          git -C /tmp/gitops commit -am "release(acc/$APP): chart $VERSION"
+          git -C /tmp/gitops push
+
+      - name: Summary
+        env:
+          APP: ${{ inputs.app }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          echo "Released image + chart $APP:$VERSION -> acc (auto-sync)." >> "$GITHUB_STEP_SUMMARY"
+          echo "Promote to prod with the k8s-promote workflow + gitops PR + manual Sync." >> "$GITHUB_STEP_SUMMARY"

@@ -44,7 +44,7 @@ jobs:
               || { echo "::error::$name must match ^[a-z0-9-]+$ (got '$val')"; exit 1; }
           done
 
-      - name: Copy acc image -> prod registry (same digest, no rebuild)
+      - name: Copy acc image + chart -> prod registry (same digest, no rebuild)
         env:
           VERSION: ${{ inputs.version }}
           PROJECT: ${{ inputs.project }}
@@ -57,8 +57,13 @@ jobs:
           DST="docker://$PROD_REGISTRY/$PROJECT/$APP:$VERSION"
           skopeo inspect "$SRC" >/dev/null || { echo "::error::acc image $SRC not found"; exit 1; }
           skopeo copy --all "$SRC" "$DST"   # registry creds pre-stored on the host
+          # Promote the immutable Helm chart artifact too (charts per version in Harbor).
+          CSRC="docker://$ACC_REGISTRY/$PROJECT/charts/$APP:$VERSION"
+          CDST="docker://$PROD_REGISTRY/$PROJECT/charts/$APP:$VERSION"
+          skopeo inspect "$CSRC" >/dev/null || { echo "::error::acc chart $CSRC not found"; exit 1; }
+          skopeo copy --all "$CSRC" "$CDST"
 
-      - name: Stage prod values bump in gitops (branch + push; PR is human-merged)
+      - name: Stage prod chart-version bump in gitops (branch + push; PR is human-merged)
         env:
           GIT_SSH_COMMAND: ssh -i /tmp/gitops-ci -o IdentitiesOnly=yes -o UserKnownHostsFile=/tmp/gitops-known_hosts -o StrictHostKeyChecking=yes
           VERSION: ${{ inputs.version }}
@@ -76,8 +81,7 @@ jobs:
           rm -rf /tmp/gitops && git clone "$GITOPS_REPO" /tmp/gitops
           br="promote/$APP-$VERSION"
           git -C /tmp/gitops switch -c "$br"
-          yq -i ".image.tag = \"$VERSION\"" "/tmp/gitops/values/prod/$APP.yaml"
-          yq -i ".spec.sources[0].targetRevision = \"release/v$VERSION\"" "/tmp/gitops/apps/prod/$APP.yaml"
+          yq -i ".spec.sources[0].targetRevision = \"$VERSION\"" "/tmp/gitops/apps/prod/$APP.yaml"
           git -C /tmp/gitops config user.name 'gitops-ci'
           git -C /tmp/gitops config user.email 'gitops-ci@k8s-hotel'
           git -C /tmp/gitops commit -am "promote(prod/$APP): $VERSION"
