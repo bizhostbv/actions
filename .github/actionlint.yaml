@@ -1,0 +1,4 @@
+self-hosted-runner:
+  # harbor-builder is a BizHost self-hosted runner with buildah, skopeo, and Harbor credentials pre-configured
+  labels:
+    - harbor-builder

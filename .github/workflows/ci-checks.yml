@@ -1,0 +1,49 @@
+name: ci-checks
+# Reusable lint/test/SAST gate. Called by app repos on PR + branch push, and as a
+# blocking needs: job before release build. Fail-closed: anything red blocks merge/build.
+on:
+  workflow_call:
+    inputs:
+      stack:        { required: true,  type: string }            # node | php
+      node_version: { required: false, type: string, default: "22" }
+      php_version:  { required: false, type: string, default: "8.3" }
+      runs_on:      { required: false, type: string, default: "ubuntu-latest" }
+      workdir:      { required: false, type: string, default: "." }
+
+jobs:
+  checks:
+    runs-on: ${{ inputs.runs_on }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.workdir }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        if: inputs.stack == 'node'
+        uses: actions/setup-node@v4
+        with: { node-version: "${{ inputs.node_version }}", cache: npm }
+      - name: Node lint / test / build
+        if: inputs.stack == 'node'
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run lint
+          npm test --if-present
+          npm run build --if-present
+
+      - name: Setup PHP
+        if: inputs.stack == 'php'
+        uses: shivammathur/setup-php@v2
+        with: { php-version: "${{ inputs.php_version }}", tools: composer }
+      - name: PHP static analysis / tests
+        if: inputs.stack == 'php'
+        run: |
+          set -euo pipefail
+          composer install --no-interaction --prefer-dist
+          composer run-script lint --no-interaction || vendor/bin/phpstan analyse
+          vendor/bin/phpunit
+
+      - name: SAST (semgrep)
+        uses: returntocorp/semgrep-action@v1
+        with: { config: "p/ci" }
