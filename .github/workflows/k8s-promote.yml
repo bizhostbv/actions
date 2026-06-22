@@ -19,17 +19,30 @@ concurrency:
   group: promote-${{ github.repository }}-${{ inputs.app }}
   cancel-in-progress: false
 
+# Promotion uses host registry creds + the gitops deploy key, never the
+# GITHUB_TOKEN. Drop all token permissions so a compromised step gets nothing.
+permissions: {}
+
 jobs:
   promote:
     runs-on: [self-hosted, harbor-builder]
     steps:
-      - name: Validate version
+      - name: Validate inputs
         env:
           VERSION: ${{ inputs.version }}
+          PROJECT: ${{ inputs.project }}
+          APP: ${{ inputs.app }}
         run: |
           set -euo pipefail
           printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
             || { echo "::error::version must be X.Y.Z"; exit 1; }
+          # project/app land in image refs and gitops file paths; constrain the
+          # charset to prevent path traversal / unexpected registry references.
+          for name in PROJECT APP; do
+            val="${!name}"
+            printf '%s' "$val" | grep -Eq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$' \
+              || { echo "::error::$name must match ^[a-z0-9-]+$ (got '$val')"; exit 1; }
+          done
 
       - name: Copy acc image -> prod registry (same digest, no rebuild)
         env:
@@ -47,15 +60,19 @@ jobs:
 
       - name: Stage prod values bump in gitops (branch + push; PR is human-merged)
         env:
-          GIT_SSH_COMMAND: ssh -i /tmp/gitops-ci -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new
+          GIT_SSH_COMMAND: ssh -i /tmp/gitops-ci -o IdentitiesOnly=yes -o UserKnownHostsFile=/tmp/gitops-known_hosts -o StrictHostKeyChecking=yes
           VERSION: ${{ inputs.version }}
           APP: ${{ inputs.app }}
           GITOPS_REPO: ${{ inputs.gitops_repo }}
           GITOPS_KEY: ${{ secrets.gitops_deploy_key }}
         run: |
           set -euo pipefail
-          trap 'rm -f /tmp/gitops-ci' EXIT
+          trap 'rm -f /tmp/gitops-ci /tmp/gitops-known_hosts' EXIT
           printf '%s\n' "$GITOPS_KEY" > /tmp/gitops-ci && chmod 600 /tmp/gitops-ci
+          # Pin github.com's published Ed25519 host key instead of TOFU
+          # (accept-new), closing the first-connection MITM window on a push that
+          # carries the prod gitops deploy key. (Default gitops_repo is github.com.)
+          printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > /tmp/gitops-known_hosts
           rm -rf /tmp/gitops && git clone "$GITOPS_REPO" /tmp/gitops
           br="promote/$APP-$VERSION"
           git -C /tmp/gitops switch -c "$br"
