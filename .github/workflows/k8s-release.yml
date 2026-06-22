@@ -26,6 +26,9 @@ concurrency:
 jobs:
   release:
     runs-on: [self-hosted, harbor-builder]
+    env:
+      HARBOR_USER: ${{ secrets.harbor_username }}    # robot$name — kept in env so the shell never re-expands the '$'
+      HARBOR_TOKEN: ${{ secrets.harbor_token }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5   # v4
 
@@ -44,16 +47,10 @@ jobs:
           echo "registry=$REG" >> "$GITHUB_OUTPUT"
           echo "image=$REG/${{ inputs.project }}/${{ inputs.app }}:$v" >> "$GITHUB_OUTPUT"
 
-      - name: Harbor login
-        env:
-          HARBOR_USER: ${{ secrets.harbor_username }}    # via env so the shell does not re-expand the '$' in robot$name
-          HARBOR_TOKEN: ${{ secrets.harbor_token }}
-        run: printf '%s' "$HARBOR_TOKEN" | buildah login -u "$HARBOR_USER" --password-stdin "${{ steps.ver.outputs.registry }}"
-
       - name: Guard — version must not already exist (immutable, no reuse)
         run: |
           set -euo pipefail
-          if skopeo inspect "docker://${{ steps.ver.outputs.image }}" >/dev/null 2>&1; then
+          if skopeo inspect --creds "$HARBOR_USER:$HARBOR_TOKEN" "docker://${{ steps.ver.outputs.image }}" >/dev/null 2>&1; then
             echo "::error::${{ steps.ver.outputs.image }} already exists — versions are immutable. Bump the semver."; exit 1
           fi
 
@@ -64,7 +61,7 @@ jobs:
           for kv in ${{ inputs.build_args }}; do BA="$BA --build-arg $kv"; done
           buildah bud --layers --isolation chroot $BA \
             -f "${{ inputs.dockerfile }}" -t "${{ steps.ver.outputs.image }}" "${{ inputs.context }}"
-          buildah push "${{ steps.ver.outputs.image }}"
+          buildah push --creds "$HARBOR_USER:$HARBOR_TOKEN" "${{ steps.ver.outputs.image }}"
 
       - name: Write immutable tag into GitOps (acc) — race-safe
         env:
