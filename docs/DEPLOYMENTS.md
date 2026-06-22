@@ -104,10 +104,17 @@ Copy `chart-template/` from `bizhostbv/actions` into your repo as `chart/`, then
 name in two places:
 
 - `chart/Chart.yaml` → `name: myapp`
-- `chart/values.yaml` → `image.repository: harbor.k8s-hotel.nl/myproject/myapp`
+- `chart/values.yaml` → `image.repository` — leave the placeholder; the real registry is set
+  **per environment** in the gitops `values/{acc,prod}/myapp.yaml` (acc and prod use different
+  registries).
 
 The chart is a minimal Deployment + Service. Add probes, env vars, or an Ingress as your app
 needs — it is your chart from here on.
+
+> **Registry is never hardcoded in CI.** The shared pipeline reads the registry from the
+> `HARBOR_REGISTRY` GitHub Actions variable (set it at org/repo level, or pass the `registry`
+> input). acc and prod set different values. The build pushes one immutable image; promoting to
+> prod copies that exact image to the prod registry.
 
 ### 4. Tell Platform you're ready
 

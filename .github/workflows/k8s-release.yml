@@ -10,7 +10,7 @@ on:
       dockerfile: { required: false, type: string, default: Dockerfile }
       context:    { required: false, type: string, default: . }
       build_args: { required: false, type: string, default: '' }   # space-separated KEY=VALUE pairs
-      registry:   { required: false, type: string, default: harbor.k8s-hotel.nl }
+      registry:   { required: false, type: string, default: '' }   # override; else uses vars.HARBOR_REGISTRY (acc/prod differ)
 
 concurrency:
   group: release-${{ github.repository }}   # github.repository = the CALLER repo
@@ -26,12 +26,15 @@ jobs:
         id: ver
         run: |
           set -euo pipefail
+          REG="${{ inputs.registry }}"
+          [ -z "$REG" ] && REG="${{ vars.HARBOR_REGISTRY }}"
+          [ -z "$REG" ] && { echo "::error::No registry: set the HARBOR_REGISTRY variable or pass the 'registry' input"; exit 1; }
           v="${GITHUB_REF#refs/heads/release/v}"
           if ! printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "::error::Branch must be release/vMAJOR.MINOR.PATCH (got '$GITHUB_REF')"; exit 1
           fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
-          echo "image=${{ inputs.registry }}/${{ inputs.project }}/${{ inputs.app }}:$v" >> "$GITHUB_OUTPUT"
+          echo "image=$REG/${{ inputs.project }}/${{ inputs.app }}:$v" >> "$GITHUB_OUTPUT"
 
       - name: Guard — version must not already exist (immutable, no reuse)
         run: |

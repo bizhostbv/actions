@@ -1,5 +1,7 @@
 image:
-  repository: harbor.k8s-hotel.nl/PROJECTNAME/APPNAME
+  # Registry differs per env (acc/prod) — set the full repository in the gitops
+  # values/<env>/<app>.yaml. This is only a placeholder default.
+  repository: REGISTRY/PROJECTNAME/APPNAME
   tag: "0.0.0"          # overridden per-env by gitops values
   pullPolicy: IfNotPresent
 replicaCount: 1
