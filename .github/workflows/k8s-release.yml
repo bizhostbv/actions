@@ -16,6 +16,8 @@ on:
       tag_key:     { required: false, type: string, default: '.image.tag' }   # yq path to the image tag to set
     secrets:
       gitops_deploy_key: { required: true }
+      harbor_username:   { required: true }
+      harbor_token:      { required: true }
 
 concurrency:
   group: release-${{ github.repository }}-${{ inputs.app }}   # per-app: matrix services coexist; same app serializes
@@ -39,7 +41,11 @@ jobs:
             echo "::error::Branch must be release/vMAJOR.MINOR.PATCH (got '$GITHUB_REF')"; exit 1
           fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "registry=$REG" >> "$GITHUB_OUTPUT"
           echo "image=$REG/${{ inputs.project }}/${{ inputs.app }}:$v" >> "$GITHUB_OUTPUT"
+
+      - name: Harbor login
+        run: buildah login -u "${{ secrets.harbor_username }}" --password-stdin "${{ steps.ver.outputs.registry }}" <<< "${{ secrets.harbor_token }}"
 
       - name: Guard — version must not already exist (immutable, no reuse)
         run: |
