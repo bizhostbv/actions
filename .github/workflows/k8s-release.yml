@@ -1,22 +1,20 @@
 name: k8s-release
-# Reusable, immutable release pipeline for any container app on K8s.
-# Caller triggers on push to release/vX.Y.Z; we build one immutable :X.Y.Z and
-# write it into gitops values/acc/<app>.yaml so acc auto-syncs. No moving tags.
+# Reusable, immutable build+push for any container app on K8s.
+# Caller triggers on push to release/vX.Y.Z; we build one immutable :X.Y.Z and push it.
+# ArgoCD Image Updater (cluster-side) detects the new tag and rolls the environment.
 on:
   workflow_call:
     inputs:
-      project:    { required: true,  type: string }   # Harbor project + ArgoCD AppProject
+      project:    { required: true,  type: string }   # Harbor project
       app:        { required: true,  type: string }   # image/app name
       dockerfile: { required: false, type: string, default: Dockerfile }
       context:    { required: false, type: string, default: . }
+      build_args: { required: false, type: string, default: '' }   # space-separated KEY=VALUE pairs
       registry:   { required: false, type: string, default: harbor.k8s-hotel.nl }
-      gitops_repo: { required: false, type: string, default: "git@github.com:bizhostbv/k8s-hotel-cluster-gitops.git" }
-    secrets:
-      gitops_deploy_key: { required: true }
 
 concurrency:
-  group: release-${{ github.repository }}   # github.repository = the CALLER repo -> one release at a time per app
-  cancel-in-progress: false                 # queue releases; never drop one
+  group: release-${{ github.repository }}   # github.repository = the CALLER repo
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -39,30 +37,17 @@ jobs:
         run: |
           set -euo pipefail
           if skopeo inspect "docker://${{ steps.ver.outputs.image }}" >/dev/null 2>&1; then
-            echo "::error::${{ steps.ver.outputs.image }} already exists — versions are immutable. Bump the semver."
-            exit 1
+            echo "::error::${{ steps.ver.outputs.image }} already exists — versions are immutable. Bump the semver."; exit 1
           fi
 
       - name: Build & push immutable image
         run: |
           set -euo pipefail
-          buildah bud --layers --isolation chroot \
+          BA=""
+          for kv in ${{ inputs.build_args }}; do BA="$BA --build-arg $kv"; done
+          buildah bud --layers --isolation chroot $BA \
             -f "${{ inputs.dockerfile }}" -t "${{ steps.ver.outputs.image }}" "${{ inputs.context }}"
-          buildah push "${{ steps.ver.outputs.image }}"   # Harbor creds pre-stored on host
-
-      - name: Bump acc values in gitops (acc auto-syncs the immutable tag)
-        env:
-          GIT_SSH_COMMAND: ssh -i /tmp/gitops-ci -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new
-        run: |
-          set -euo pipefail
-          install -m600 /dev/stdin /tmp/gitops-ci <<< "${{ secrets.gitops_deploy_key }}"
-          rm -rf /tmp/gitops && git clone "${{ inputs.gitops_repo }}" /tmp/gitops
-          yq -i ".image.tag = \"${{ steps.ver.outputs.version }}\"" "/tmp/gitops/values/acc/${{ inputs.app }}.yaml"
-          git -C /tmp/gitops config user.name  'gitops-ci'
-          git -C /tmp/gitops config user.email 'gitops-ci@k8s-hotel'
-          git -C /tmp/gitops commit -am "release(acc/${{ inputs.app }}): ${{ steps.ver.outputs.version }}"
-          git -C /tmp/gitops push
-          rm -f /tmp/gitops-ci
+          buildah push "${{ steps.ver.outputs.image }}"
 
       - name: Summary
-        run: echo "Released ${{ steps.ver.outputs.image }} -> acc (auto-sync). Promote to prod via gitops PR." >> "$GITHUB_STEP_SUMMARY"
+        run: echo "Pushed ${{ steps.ver.outputs.image }}. ArgoCD Image Updater rolls the environment." >> "$GITHUB_STEP_SUMMARY"

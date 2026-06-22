@@ -6,7 +6,8 @@ to onboard your app, then releasing is two commands.
 ## TL;DR
 
 1. **A release is a branch.** `git switch -c release/v1.2.0 && git push -u origin release/v1.2.0`.
-2. **That branch auto-deploys to acc** — the pipeline builds `…:1.2.0` and ArgoCD rolls it out.
+2. **That branch auto-deploys to acc** — CI builds and pushes `…:1.2.0`; ArgoCD Image Updater
+   detects the new tag and rolls acc out automatically.
 3. **Prod is a small reviewed PR + one sync click.** Nothing reaches prod by accident.
 
 Three rules that never bend:
@@ -26,7 +27,10 @@ Three rules that never bend:
   GitHub Actions (shared pipeline, runs on our build host)
     1. build image from your Dockerfile
     2. push  harbor.k8s-hotel.nl/<project>/<app>:1.2.0   (immutable)
-    3. write "tag: 1.2.0" into the gitops repo (acc)
+        │
+        ▼
+  ArgoCD Image Updater (cluster component)
+    detects :1.2.0 in Harbor, writes "tag: 1.2.0" into the gitops repo (acc)
         │
         ▼
   ArgoCD (acc)  ──auto-sync──►  your app runs in namespace <app>-acc
@@ -49,7 +53,7 @@ repo. Your repo just calls it.
 
 | Step | Who | When |
 |------|-----|------|
-| One-time platform setup (build runner, Harbor project, gitops apps, deploy key) | **Platform/DevOps** | Once per app, see "Onboarding — platform" |
+| One-time platform setup (build runner, Harbor project, gitops apps, Image Updater annotations) | **Platform/DevOps** | Once per app, see "Onboarding — platform" |
 | Add the caller workflow + chart to the app repo | **You (developer)** | Once per app |
 | Cut a release branch, release to acc | **You (developer)** | Every release |
 | Approve the prod PR + click Sync | **A second maintainer** | Every prod promotion |
@@ -80,11 +84,9 @@ jobs:
     with:
       project: myproject
       app: myapp
-    secrets:
-      gitops_deploy_key: ${{ secrets.GITOPS_DEPLOY_KEY }}
 ```
 
-That is the entire CI config. The build/push/deploy logic is in the shared workflow — you never
+That is the entire CI config. The build/push logic is in the shared workflow — you never
 copy or edit it.
 
 ### 2. Make sure your app has a Dockerfile
@@ -109,9 +111,9 @@ needs — it is your chart from here on.
 
 ### 4. Tell Platform you're ready
 
-Ask Platform/DevOps to do the one-time setup for `myapp` (Harbor project, deploy-key secret,
-and the acc + prod ArgoCD apps in the gitops repo). They have a checklist; you just need to
-give them: **app name**, **project name**, and **repo URL**.
+Ask Platform/DevOps to do the one-time setup for `myapp` (Harbor project and the acc + prod
+ArgoCD apps in the gitops repo). They have a checklist; you just need to give them:
+**app name**, **project name**, and **repo URL**.
 
 ✅ **Onboarding done.** From now on, releasing is the next section.
 
@@ -127,8 +129,9 @@ git push -u origin release/v1.2.0
 
 That's it. Watch it:
 
-- **Build/deploy:** GitHub → Actions tab → the "release" run.
-- **Rollout:** ArgoCD UI at https://argocd.k8s-hotel.nl → app `myapp-acc` → should go Synced/Healthy.
+- **Build/push:** GitHub → Actions tab → the "release" run.
+- **Image Updater + rollout:** ArgoCD UI at https://argocd.k8s-hotel.nl → app `myapp-acc` → ArgoCD
+  Image Updater writes the new tag into gitops and ArgoCD auto-syncs → should go Synced/Healthy.
 - **Image in registry:** https://harbor.k8s-hotel.nl → project `myproject` → `myapp` → tag `1.2.0`.
 
 Now test your app on acc.
@@ -189,14 +192,17 @@ deterministic — no rebuild, no guessing.
 Not for developers. Done once when onboarding `myapp`:
 
 1. **Harbor:** create project `myproject`; add an immutable-tag rule matching `[0-9]*.[0-9]*.[0-9]*`.
-2. **Deploy key:** ensure the app repo has the `GITOPS_DEPLOY_KEY` secret (the shared write key to
-   the gitops repo) so CI can bump acc values.
-3. **GitOps — acc:** add `apps/acc/myapp.yaml` (auto-sync, namespace `myapp-acc`) and
-   `values/acc/myapp.yaml` (CI rewrites `image.tag`).
-4. **GitOps — prod:** add `apps/prod/myapp.yaml` (manual sync, tracks the release branch, namespace
+2. **GitOps — acc:** add `apps/acc/myapp.yaml` (auto-sync, namespace `myapp-acc`) and
+   `values/acc/myapp.yaml` (ArgoCD Image Updater rewrites `image.tag`).
+3. **GitOps — prod:** add `apps/prod/myapp.yaml` (manual sync, tracks the release branch, namespace
    `myapp-prod`) and `values/prod/myapp.yaml` (pinned `image.tag`, bumped only by the promote PR).
-5. **AppProject:** allow the app repo URL as an ArgoCD source.
-6. **Runner:** confirm the self-hosted `harbor-builder` runner is available to the app repo.
+4. **AppProject:** allow the app repo URL as an ArgoCD source.
+5. **Runner:** confirm the self-hosted `harbor-builder` runner is available to the app repo.
+6. **ArgoCD Image Updater:** configured once at platform level — it watches Harbor for new semver
+   tags and writes the updated tag back to gitops automatically. Per app, add the Image Updater
+   annotations to the app's ArgoCD Application manifest (e.g.
+   `argocd-image-updater.argoproj.io/image-list`, `argocd-image-updater.argoproj.io/write-back-method`).
+   No per-app deploy key or CI secret is required.
 
 Exact file contents and commands are maintained by the Platform team in the gitops repo and the
 deployment implementation plan.
