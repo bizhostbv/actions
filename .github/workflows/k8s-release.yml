@@ -18,7 +18,7 @@ on:
       gitops_deploy_key: { required: true }
 
 concurrency:
-  group: release-${{ github.repository }}   # github.repository = the CALLER repo
+  group: release-${{ github.repository }}-${{ inputs.app }}   # per-app: matrix services coexist; same app serializes
   cancel-in-progress: false
 
 jobs:
