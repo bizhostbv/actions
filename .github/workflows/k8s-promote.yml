@@ -60,7 +60,7 @@ jobs:
           br="promote/$APP-$VERSION"
           git -C /tmp/gitops switch -c "$br"
           yq -i ".image.tag = \"$VERSION\"" "/tmp/gitops/values/prod/$APP.yaml"
-          yq -i ".spec.source.targetRevision = \"release/v$VERSION\"" "/tmp/gitops/apps/prod/$APP.yaml"
+          yq -i ".spec.sources[0].targetRevision = \"release/v$VERSION\"" "/tmp/gitops/apps/prod/$APP.yaml"
           git -C /tmp/gitops config user.name 'gitops-ci'
           git -C /tmp/gitops config user.email 'gitops-ci@k8s-hotel'
           git -C /tmp/gitops commit -am "promote(prod/$APP): $VERSION"
