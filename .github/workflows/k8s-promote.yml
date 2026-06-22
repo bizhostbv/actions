@@ -1,0 +1,60 @@
+name: k8s-promote
+# Promote an already-validated acc image to prod: copy the immutable :X.Y.Z from the
+# acc registry to the prod registry (same digest, no rebuild) and push a prod-values bump
+# branch to the gitops repo. A human opens/merges the PR (four-eyes) and clicks Sync in
+# the prod ArgoCD. This workflow never deploys; it only stages the promotion.
+on:
+  workflow_call:
+    inputs:
+      project:       { required: true,  type: string }
+      app:           { required: true,  type: string }
+      version:       { required: true,  type: string }   # X.Y.Z, must already exist on acc
+      acc_registry:  { required: false, type: string, default: harbor.k8s-hotel.nl }
+      prod_registry: { required: false, type: string, default: registry.k8s-bizhost.nl }
+      gitops_repo:   { required: false, type: string, default: "git@github.com:globalcontrolgroup/gcg-shop-gitops.git" }
+    secrets:
+      gitops_deploy_key: { required: true }
+
+concurrency:
+  group: promote-${{ github.repository }}-${{ inputs.app }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: [self-hosted, harbor-builder]
+    steps:
+      - name: Validate version
+        run: |
+          set -euo pipefail
+          printf '%s' "${{ inputs.version }}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "::error::version must be X.Y.Z"; exit 1; }
+
+      - name: Copy acc image -> prod registry (same digest, no rebuild)
+        run: |
+          set -euo pipefail
+          SRC="docker://${{ inputs.acc_registry }}/${{ inputs.project }}/${{ inputs.app }}:${{ inputs.version }}"
+          DST="docker://${{ inputs.prod_registry }}/${{ inputs.project }}/${{ inputs.app }}:${{ inputs.version }}"
+          skopeo inspect "$SRC" >/dev/null || { echo "::error::acc image $SRC not found"; exit 1; }
+          skopeo copy --all "$SRC" "$DST"   # registry creds pre-stored on the host
+
+      - name: Stage prod values bump in gitops (branch + push; PR is human-merged)
+        env:
+          GIT_SSH_COMMAND: ssh -i /tmp/gitops-ci -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new
+        run: |
+          set -euo pipefail
+          install -m600 /dev/stdin /tmp/gitops-ci <<< "${{ secrets.gitops_deploy_key }}"
+          rm -rf /tmp/gitops && git clone "${{ inputs.gitops_repo }}" /tmp/gitops
+          br="promote/${{ inputs.app }}-${{ inputs.version }}"
+          git -C /tmp/gitops switch -c "$br"
+          yq -i ".image.tag = \"${{ inputs.version }}\"" "/tmp/gitops/values/prod/${{ inputs.app }}.yaml"
+          yq -i ".spec.source.targetRevision = \"release/v${{ inputs.version }}\"" "/tmp/gitops/apps/prod/${{ inputs.app }}.yaml"
+          git -C /tmp/gitops config user.name 'gitops-ci'
+          git -C /tmp/gitops config user.email 'gitops-ci@k8s-hotel'
+          git -C /tmp/gitops commit -am "promote(prod/${{ inputs.app }}): ${{ inputs.version }}"
+          git -C /tmp/gitops push -u origin "$br"
+          rm -f /tmp/gitops-ci
+
+      - name: Summary
+        run: |
+          echo "Copied ${{ inputs.app }}:${{ inputs.version }} to prod registry." >> "$GITHUB_STEP_SUMMARY"
+          echo "Open & merge the gitops PR for branch promote/${{ inputs.app }}-${{ inputs.version }}, then Sync prod ArgoCD." >> "$GITHUB_STEP_SUMMARY"
