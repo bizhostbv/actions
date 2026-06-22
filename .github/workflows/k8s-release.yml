@@ -68,6 +68,9 @@ jobs:
           GIT_SSH_COMMAND: ssh -i /tmp/gitops-ci -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new
         run: |
           set -euo pipefail
+          # ensure yq is available (portable across runners; no host preinstall needed)
+          YQ=yq
+          command -v yq >/dev/null 2>&1 || { YQ="${RUNNER_TEMP:-/tmp}/yq"; [ -x "$YQ" ] || { curl -fsSL https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_amd64 -o "$YQ"; chmod +x "$YQ"; }; }
           install -m600 /dev/stdin /tmp/gitops-ci <<< "${{ secrets.gitops_deploy_key }}"
           VF="${{ inputs.values_file }}"; [ -z "$VF" ] && VF="values/acc/${{ inputs.app }}.yaml"
           rm -rf /tmp/gitops && git clone --quiet "${{ inputs.gitops_repo }}" /tmp/gitops
@@ -77,7 +80,7 @@ jobs:
           for attempt in 1 2 3 4 5; do
             git fetch -q origin main
             git reset --hard -q origin/main
-            yq -i "${{ inputs.tag_key }} = \"${{ steps.ver.outputs.version }}\"" "$VF"
+            "$YQ" -i "${{ inputs.tag_key }} = \"${{ steps.ver.outputs.version }}\"" "$VF"
             if git diff --quiet; then echo "tag already ${{ steps.ver.outputs.version }}"; pushed=1; break; fi
             git commit -aqm "release(acc/${{ inputs.app }}): ${{ steps.ver.outputs.version }}"
             if git push -q origin HEAD:main; then echo "pushed on attempt $attempt"; pushed=1; break; fi
