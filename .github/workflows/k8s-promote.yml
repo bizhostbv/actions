@@ -1,0 +1,92 @@
+name: k8s-promote
+# Promote an already-validated acc image to prod: copy the immutable :X.Y.Z from the
+# acc registry to the prod registry (same digest, no rebuild) and push a prod-values bump
+# branch to the gitops repo. A human opens/merges the PR (four-eyes) and clicks Sync in
+# the prod ArgoCD. This workflow never deploys; it only stages the promotion.
+on:
+  workflow_call:
+    inputs:
+      project:       { required: true,  type: string }
+      app:           { required: true,  type: string }
+      version:       { required: true,  type: string }   # X.Y.Z, must already exist on acc
+      acc_registry:  { required: false, type: string, default: harbor.k8s-hotel.nl }
+      prod_registry: { required: false, type: string, default: registry.k8s-bizhost.nl }
+      gitops_repo:   { required: false, type: string, default: "git@github.com:globalcontrolgroup/gcg-shop-gitops.git" }
+    secrets:
+      gitops_deploy_key: { required: true }
+
+concurrency:
+  group: promote-${{ github.repository }}-${{ inputs.app }}
+  cancel-in-progress: false
+
+# Promotion uses host registry creds + the gitops deploy key, never the
+# GITHUB_TOKEN. Drop all token permissions so a compromised step gets nothing.
+permissions: {}
+
+jobs:
+  promote:
+    runs-on: [self-hosted, harbor-builder]
+    steps:
+      - name: Validate inputs
+        env:
+          VERSION: ${{ inputs.version }}
+          PROJECT: ${{ inputs.project }}
+          APP: ${{ inputs.app }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "::error::version must be X.Y.Z"; exit 1; }
+          # project/app land in image refs and gitops file paths; constrain the
+          # charset to prevent path traversal / unexpected registry references.
+          for name in PROJECT APP; do
+            val="${!name}"
+            printf '%s' "$val" | grep -Eq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$' \
+              || { echo "::error::$name must match ^[a-z0-9-]+$ (got '$val')"; exit 1; }
+          done
+
+      - name: Copy acc image -> prod registry (same digest, no rebuild)
+        env:
+          VERSION: ${{ inputs.version }}
+          PROJECT: ${{ inputs.project }}
+          APP: ${{ inputs.app }}
+          ACC_REGISTRY: ${{ inputs.acc_registry }}
+          PROD_REGISTRY: ${{ inputs.prod_registry }}
+        run: |
+          set -euo pipefail
+          SRC="docker://$ACC_REGISTRY/$PROJECT/$APP:$VERSION"
+          DST="docker://$PROD_REGISTRY/$PROJECT/$APP:$VERSION"
+          skopeo inspect "$SRC" >/dev/null || { echo "::error::acc image $SRC not found"; exit 1; }
+          skopeo copy --all "$SRC" "$DST"   # registry creds pre-stored on the host
+
+      - name: Stage prod values bump in gitops (branch + push; PR is human-merged)
+        env:
+          GIT_SSH_COMMAND: ssh -i /tmp/gitops-ci -o IdentitiesOnly=yes -o UserKnownHostsFile=/tmp/gitops-known_hosts -o StrictHostKeyChecking=yes
+          VERSION: ${{ inputs.version }}
+          APP: ${{ inputs.app }}
+          GITOPS_REPO: ${{ inputs.gitops_repo }}
+          GITOPS_KEY: ${{ secrets.gitops_deploy_key }}
+        run: |
+          set -euo pipefail
+          trap 'rm -f /tmp/gitops-ci /tmp/gitops-known_hosts' EXIT
+          printf '%s\n' "$GITOPS_KEY" > /tmp/gitops-ci && chmod 600 /tmp/gitops-ci
+          # Pin github.com's published Ed25519 host key instead of TOFU
+          # (accept-new), closing the first-connection MITM window on a push that
+          # carries the prod gitops deploy key. (Default gitops_repo is github.com.)
+          printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > /tmp/gitops-known_hosts
+          rm -rf /tmp/gitops && git clone "$GITOPS_REPO" /tmp/gitops
+          br="promote/$APP-$VERSION"
+          git -C /tmp/gitops switch -c "$br"
+          yq -i ".image.tag = \"$VERSION\"" "/tmp/gitops/values/prod/$APP.yaml"
+          yq -i ".spec.sources[0].targetRevision = \"release/v$VERSION\"" "/tmp/gitops/apps/prod/$APP.yaml"
+          git -C /tmp/gitops config user.name 'gitops-ci'
+          git -C /tmp/gitops config user.email 'gitops-ci@k8s-hotel'
+          git -C /tmp/gitops commit -am "promote(prod/$APP): $VERSION"
+          git -C /tmp/gitops push -u origin "$br"
+
+      - name: Summary
+        env:
+          VERSION: ${{ inputs.version }}
+          APP: ${{ inputs.app }}
+        run: |
+          echo "Copied $APP:$VERSION to prod registry." >> "$GITHUB_STEP_SUMMARY"
+          echo "Open & merge the gitops PR for branch promote/$APP-$VERSION, then Sync prod ArgoCD." >> "$GITHUB_STEP_SUMMARY"

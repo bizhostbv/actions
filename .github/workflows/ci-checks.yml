@@ -1,0 +1,61 @@
+name: ci-checks
+# Reusable lint/test/SAST gate. Called by app repos on PR + branch push, and as a
+# blocking needs: job before release build. Fail-closed: anything red blocks merge/build.
+on:
+  workflow_call:
+    inputs:
+      stack:        { required: true,  type: string }            # node | php
+      node_version: { required: false, type: string, default: "22" }
+      php_version:  { required: false, type: string, default: "8.3" }
+      runs_on:      { required: false, type: string, default: "ubuntu-latest" }
+      workdir:      { required: false, type: string, default: "." }
+
+# Least-privilege: this gate only reads the repo. Reusable workflows inherit the
+# caller's token permissions unless pinned here.
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ${{ inputs.runs_on }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.workdir }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Node
+        if: inputs.stack == 'node'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version: "${{ inputs.node_version }}", cache: npm }
+      - name: Node lint / test / build
+        if: inputs.stack == 'node'
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run lint
+          npm test --if-present
+          npm run build --if-present
+
+      - name: Setup PHP
+        if: inputs.stack == 'php'
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
+        with: { php-version: "${{ inputs.php_version }}", tools: composer }
+      - name: PHP static analysis / tests
+        if: inputs.stack == 'php'
+        run: |
+          set -euo pipefail
+          composer install --no-interaction --prefer-dist
+          # Prefer the composer `lint` script; fall back to phpstan only when it is
+          # absent. The previous `lint || phpstan` masked real lint failures (a
+          # failing lint silently fell through to phpstan), breaking fail-closed.
+          if composer run-script --list 2>/dev/null | grep -qE '^\s*lint\b'; then
+            composer run-script lint --no-interaction
+          else
+            vendor/bin/phpstan analyse
+          fi
+          vendor/bin/phpunit
+
+      - name: SAST (semgrep)
+        uses: semgrep/semgrep-action@713efdd345f3035192eaa63f56867b88e63e4e5d # v1
+        with: { config: "p/ci" }
