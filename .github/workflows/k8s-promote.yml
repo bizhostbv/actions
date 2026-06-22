@@ -24,37 +24,52 @@ jobs:
     runs-on: [self-hosted, harbor-builder]
     steps:
       - name: Validate version
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          printf '%s' "${{ inputs.version }}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+          printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
             || { echo "::error::version must be X.Y.Z"; exit 1; }
 
       - name: Copy acc image -> prod registry (same digest, no rebuild)
+        env:
+          VERSION: ${{ inputs.version }}
+          PROJECT: ${{ inputs.project }}
+          APP: ${{ inputs.app }}
+          ACC_REGISTRY: ${{ inputs.acc_registry }}
+          PROD_REGISTRY: ${{ inputs.prod_registry }}
         run: |
           set -euo pipefail
-          SRC="docker://${{ inputs.acc_registry }}/${{ inputs.project }}/${{ inputs.app }}:${{ inputs.version }}"
-          DST="docker://${{ inputs.prod_registry }}/${{ inputs.project }}/${{ inputs.app }}:${{ inputs.version }}"
+          SRC="docker://$ACC_REGISTRY/$PROJECT/$APP:$VERSION"
+          DST="docker://$PROD_REGISTRY/$PROJECT/$APP:$VERSION"
           skopeo inspect "$SRC" >/dev/null || { echo "::error::acc image $SRC not found"; exit 1; }
           skopeo copy --all "$SRC" "$DST"   # registry creds pre-stored on the host
 
       - name: Stage prod values bump in gitops (branch + push; PR is human-merged)
         env:
           GIT_SSH_COMMAND: ssh -i /tmp/gitops-ci -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new
+          VERSION: ${{ inputs.version }}
+          APP: ${{ inputs.app }}
+          GITOPS_REPO: ${{ inputs.gitops_repo }}
+          GITOPS_KEY: ${{ secrets.gitops_deploy_key }}
         run: |
           set -euo pipefail
-          install -m600 /dev/stdin /tmp/gitops-ci <<< "${{ secrets.gitops_deploy_key }}"
-          rm -rf /tmp/gitops && git clone "${{ inputs.gitops_repo }}" /tmp/gitops
-          br="promote/${{ inputs.app }}-${{ inputs.version }}"
+          trap 'rm -f /tmp/gitops-ci' EXIT
+          printf '%s\n' "$GITOPS_KEY" > /tmp/gitops-ci && chmod 600 /tmp/gitops-ci
+          rm -rf /tmp/gitops && git clone "$GITOPS_REPO" /tmp/gitops
+          br="promote/$APP-$VERSION"
           git -C /tmp/gitops switch -c "$br"
-          yq -i ".image.tag = \"${{ inputs.version }}\"" "/tmp/gitops/values/prod/${{ inputs.app }}.yaml"
-          yq -i ".spec.source.targetRevision = \"release/v${{ inputs.version }}\"" "/tmp/gitops/apps/prod/${{ inputs.app }}.yaml"
+          yq -i ".image.tag = \"$VERSION\"" "/tmp/gitops/values/prod/$APP.yaml"
+          yq -i ".spec.source.targetRevision = \"release/v$VERSION\"" "/tmp/gitops/apps/prod/$APP.yaml"
           git -C /tmp/gitops config user.name 'gitops-ci'
           git -C /tmp/gitops config user.email 'gitops-ci@k8s-hotel'
-          git -C /tmp/gitops commit -am "promote(prod/${{ inputs.app }}): ${{ inputs.version }}"
+          git -C /tmp/gitops commit -am "promote(prod/$APP): $VERSION"
           git -C /tmp/gitops push -u origin "$br"
-          rm -f /tmp/gitops-ci
 
       - name: Summary
+        env:
+          VERSION: ${{ inputs.version }}
+          APP: ${{ inputs.app }}
         run: |
-          echo "Copied ${{ inputs.app }}:${{ inputs.version }} to prod registry." >> "$GITHUB_STEP_SUMMARY"
-          echo "Open & merge the gitops PR for branch promote/${{ inputs.app }}-${{ inputs.version }}, then Sync prod ArgoCD." >> "$GITHUB_STEP_SUMMARY"
+          echo "Copied $APP:$VERSION to prod registry." >> "$GITHUB_STEP_SUMMARY"
+          echo "Open & merge the gitops PR for branch promote/$APP-$VERSION, then Sync prod ArgoCD." >> "$GITHUB_STEP_SUMMARY"
