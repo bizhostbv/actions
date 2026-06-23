@@ -9,6 +9,15 @@ on:
       php_version:  { required: false, type: string, default: "8.3" }
       runs_on:      { required: false, type: string, default: "ubuntu-latest" }
       workdir:      { required: false, type: string, default: "." }
+      # Optional throwaway test database (php). Off by default; opt in with db: mysql
+      # for repos whose phpunit suite boots the kernel against a real DB. The schema is
+      # the app's responsibility (e.g. tests/bootstrap.php runs doctrine:schema:update).
+      db:            { required: false, type: string, default: "" }          # "" | mysql
+      db_image:      { required: false, type: string, default: "mysql:8.4" }
+      db_name:       { required: false, type: string, default: "app_test" }
+      db_user:       { required: false, type: string, default: "app" }
+      db_password:   { required: false, type: string, default: "app" }
+      db_host_alias: { required: false, type: string, default: "" }          # /etc/hosts name -> 127.0.0.1 (match the app's forced DATABASE_URL host)
 
 # Least-privilege: this gate only reads the repo. Reusable workflows inherit the
 # caller's token permissions unless pinned here.
@@ -36,6 +45,35 @@ jobs:
           npm run lint
           npm test --if-present
           npm run build --if-present
+
+      - name: Start throwaway test database (php, opt-in)
+        if: inputs.stack == 'php' && inputs.db == 'mysql'
+        env:
+          DB_IMAGE: ${{ inputs.db_image }}
+          DB_NAME: ${{ inputs.db_name }}
+          DB_USER: ${{ inputs.db_user }}
+          DB_PASSWORD: ${{ inputs.db_password }}
+          DB_HOST_ALIAS: ${{ inputs.db_host_alias }}
+        run: |
+          set -euo pipefail
+          docker run -d --name ci-mysql -p 3306:3306 \
+            -e MYSQL_ROOT_PASSWORD=root \
+            -e MYSQL_DATABASE="$DB_NAME" \
+            -e MYSQL_USER="$DB_USER" \
+            -e MYSQL_PASSWORD="$DB_PASSWORD" \
+            "$DB_IMAGE"
+          # Let the app's forced DATABASE_URL host (e.g. a docker-compose service name)
+          # resolve to the service published on localhost.
+          if [ -n "$DB_HOST_ALIAS" ]; then
+            echo "127.0.0.1 $DB_HOST_ALIAS" | sudo tee -a /etc/hosts >/dev/null
+          fi
+          echo "waiting for mysql to accept connections..."
+          for _ in $(seq 1 60); do
+            if docker exec ci-mysql mysqladmin ping -uroot -proot --silent 2>/dev/null; then
+              echo "mysql ready"; break
+            fi
+            sleep 2
+          done
 
       - name: Setup PHP
         if: inputs.stack == 'php'
