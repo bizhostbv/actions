@@ -25,8 +25,10 @@ concurrency:
   group: release-${{ github.repository }}   # one release at a time per app repo
   cancel-in-progress: false                 # queue releases; never drop one
 
-# Release uses host registry creds + the gitops deploy key, never the GITHUB_TOKEN.
-permissions: {}
+# checkout needs contents:read to clone this (private) repo via GITHUB_TOKEN;
+# everything else (registry push, gitops push) uses host creds + the deploy key.
+permissions:
+  contents: read
 
 jobs:
   release:
