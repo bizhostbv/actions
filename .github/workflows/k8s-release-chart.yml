@@ -1,9 +1,18 @@
 name: k8s-release-chart
-# Immutable, chart-aware release. On push to release/vX.Y.Z this builds one immutable
-# image :X.Y.Z AND packages the Helm chart as an immutable OCI artifact vX.Y.Z (the image
-# tag is baked into the chart), pushes both to the acc registry, and bumps the acc ArgoCD
-# Application's chart targetRevision in the gitops repo. acc auto-syncs the new version.
-# Pure-gitops: the running version == the chart version (no moving tags, no mutable branch).
+# Immutable, chart-aware release. Builds one immutable image :X.Y.Z AND packages the Helm
+# chart as an immutable OCI artifact vX.Y.Z (the image tag is baked into the chart), pushes
+# both to the acc registry, and bumps the acc ArgoCD Application's chart targetRevision in
+# the gitops repo. acc auto-syncs the new version. Pure-gitops: the running version == the
+# chart version (no moving tags, no mutable branch).
+#
+# Versioning (input `version_from`):
+#   branch       (default): caller pushes release/vX.Y.Z; the version comes from the branch.
+#   conventional          : caller pushes its default branch; the version is computed from
+#                           Conventional Commits since the last tag (feat->minor, fix->patch,
+#                           `type!:`/BREAKING->major; 0.x breaking->minor) and the new vX.Y.Z
+#                           tag is pushed with `tag_deploy_key`. A push with only chore/docs
+#                           commits releases nothing. This keeps the workflow at contents:read
+#                           (the deploy key, not the GITHUB_TOKEN, pushes the tag).
 #
 # Runner prerequisites (pre-stored on the self-hosted host, never GITHUB_TOKEN):
 #   - buildah login <registry>      (image push)
@@ -11,15 +20,17 @@ name: k8s-release-chart
 on:
   workflow_call:
     inputs:
-      project:     { required: true,  type: string }                                  # Harbor project (e.g. gcg)
-      app:         { required: true,  type: string }                                  # image + chart name (e.g. shop-backend)
-      dockerfile:  { required: false, type: string, default: Dockerfile }
-      context:     { required: false, type: string, default: . }
-      chart_dir:   { required: false, type: string, default: chart }
-      registry:    { required: false, type: string, default: harbor.k8s-hotel.nl }
-      gitops_repo: { required: false, type: string, default: "git@github.com:globalcontrolgroup/gcg-shop-gitops.git" }
+      project:      { required: true,  type: string }                                  # Harbor project (e.g. gcg)
+      app:          { required: true,  type: string }                                  # image + chart name (e.g. shop-backend)
+      dockerfile:   { required: false, type: string, default: Dockerfile }
+      context:      { required: false, type: string, default: . }
+      chart_dir:    { required: false, type: string, default: chart }
+      registry:     { required: false, type: string, default: harbor.k8s-hotel.nl }
+      gitops_repo:  { required: false, type: string, default: "git@github.com:globalcontrolgroup/gcg-shop-gitops.git" }
+      version_from: { required: false, type: string, default: branch }                 # 'branch' (release/vX.Y.Z) | 'conventional'
     secrets:
       gitops_deploy_key: { required: true }
+      tag_deploy_key:    { required: false }   # write deploy key on the CALLER's app repo; required when version_from == 'conventional' (pushes the computed vX.Y.Z tag)
 
 concurrency:
   group: release-${{ github.repository }}   # one release at a time per app repo
@@ -35,20 +46,71 @@ jobs:
     runs-on: [self-hosted, harbor-builder]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history + tags for version_from=conventional (harmless for branch mode)
 
-      - name: Derive & validate version from branch
+      - name: Derive & validate version
         id: ver
         env:
           REF: ${{ github.ref }}
+          VERSION_FROM: ${{ inputs.version_from }}
+          TAG_KEY: ${{ secrets.tag_deploy_key }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          v="${REF#refs/heads/release/v}"
-          if ! printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::Branch must be release/vMAJOR.MINOR.PATCH (got '$REF')"; exit 1
-          fi
-          echo "version=$v" >> "$GITHUB_OUTPUT"
+          case "$VERSION_FROM" in
+            branch)
+              v="${REF#refs/heads/release/v}"
+              printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+                || { echo "::error::version_from=branch needs a release/vMAJOR.MINOR.PATCH branch (got '$REF')"; exit 1; }
+              echo "version=$v" >> "$GITHUB_OUTPUT"
+              echo "released=true" >> "$GITHUB_OUTPUT"
+              ;;
+            conventional)
+              [ -n "$TAG_KEY" ] || { echo "::error::version_from=conventional requires the tag_deploy_key secret (write deploy key on the app repo)"; exit 1; }
+              git fetch --tags --force >/dev/null 2>&1 || true
+              LATEST=$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)
+              if [ -z "$LATEST" ]; then BASE="v0.0.0"; RANGE="HEAD"; else BASE="$LATEST"; RANGE="${LATEST}..HEAD"; fi
+              SUBJECTS=$(git log "$RANGE" --no-merges --format='%s' || true)
+              BODIES=$(git log "$RANGE" --no-merges --format='%b' || true)
+              BUMP="none"
+              if echo "$SUBJECTS" | grep -qE '^[a-zA-Z]+(\([^)]*\))?!:' || echo "$BODIES" | grep -qE 'BREAKING[ -]CHANGE'; then BUMP="major"
+              elif echo "$SUBJECTS" | grep -qE '^feat(\([^)]*\))?:'; then BUMP="minor"
+              elif echo "$SUBJECTS" | grep -qE '^fix(\([^)]*\))?:'; then BUMP="patch"
+              fi
+              if [ "$BUMP" = "none" ]; then
+                echo "No feat/fix/breaking commits since ${BASE} — no release." | tee -a "$GITHUB_STEP_SUMMARY"
+                echo "released=false" >> "$GITHUB_OUTPUT"; exit 0
+              fi
+              V="${BASE#v}"; MAJ="${V%%.*}"; REST="${V#*.}"; MIN="${REST%%.*}"; PAT="${REST##*.}"
+              # 0.x: a breaking change bumps MINOR, not MAJOR (avoid a premature 1.0)
+              { [ "$BUMP" = "major" ] && [ "$MAJ" -eq 0 ]; } && BUMP="minor" || true
+              case "$BUMP" in
+                major) MAJ=$((MAJ+1)); MIN=0; PAT=0;;
+                minor) MIN=$((MIN+1)); PAT=0;;
+                patch) PAT=$((PAT+1));;
+              esac
+              NEW="${MAJ}.${MIN}.${PAT}"
+              # Push the tag with the deploy key so the workflow stays contents:read. Pin
+              # github.com's host key (no TOFU) since this push carries a deploy key.
+              trap 'rm -f /tmp/tag-ci /tmp/tag-known' EXIT
+              printf '%s\n' "$TAG_KEY" > /tmp/tag-ci && chmod 600 /tmp/tag-ci
+              printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > /tmp/tag-known
+              export GIT_SSH_COMMAND="ssh -i /tmp/tag-ci -o IdentitiesOnly=yes -o UserKnownHostsFile=/tmp/tag-known -o StrictHostKeyChecking=yes"
+              git config user.name 'gitops-ci'; git config user.email 'gitops-ci@k8s-hotel'
+              git tag -a "v${NEW}" -m "release v${NEW}"
+              git push "git@github.com:${REPO}.git" "v${NEW}"
+              echo "version=${NEW}" >> "$GITHUB_OUTPUT"
+              echo "released=true" >> "$GITHUB_OUTPUT"
+              echo "Conventional release v${NEW} (${BUMP} from ${BASE})" | tee -a "$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              echo "::error::version_from must be 'branch' or 'conventional' (got '$VERSION_FROM')"; exit 1
+              ;;
+          esac
 
       - name: Validate project/app (charset — they land in registry refs and file paths)
+        if: steps.ver.outputs.released == 'true'
         env:
           PROJECT: ${{ inputs.project }}
           APP: ${{ inputs.app }}
@@ -61,6 +123,7 @@ jobs:
           done
 
       - name: Guard — image & chart must not already exist (immutable, no reuse)
+        if: steps.ver.outputs.released == 'true'
         env:
           REGISTRY: ${{ inputs.registry }}
           PROJECT: ${{ inputs.project }}
@@ -76,6 +139,7 @@ jobs:
           fi
 
       - name: Build & push immutable image
+        if: steps.ver.outputs.released == 'true'
         env:
           REGISTRY: ${{ inputs.registry }}
           PROJECT: ${{ inputs.project }}
@@ -90,6 +154,7 @@ jobs:
           buildah push "$IMG"   # Harbor creds pre-stored on the host
 
       - name: Package & push immutable chart (image tag baked in)
+        if: steps.ver.outputs.released == 'true'
         env:
           REGISTRY: ${{ inputs.registry }}
           PROJECT: ${{ inputs.project }}
@@ -106,6 +171,7 @@ jobs:
           helm push "/tmp/chartpkg/$APP-$VERSION.tgz" "oci://$REGISTRY/$PROJECT/charts"   # helm registry login pre-stored on host
 
       - name: Bump acc Application chart targetRevision in gitops (acc auto-syncs)
+        if: steps.ver.outputs.released == 'true'
         env:
           GIT_SSH_COMMAND: ssh -i /tmp/gitops-ci -o IdentitiesOnly=yes -o UserKnownHostsFile=/tmp/gitops-known_hosts -o StrictHostKeyChecking=yes
           VERSION: ${{ steps.ver.outputs.version }}
@@ -127,6 +193,7 @@ jobs:
           git -C /tmp/gitops push
 
       - name: Summary
+        if: steps.ver.outputs.released == 'true'
         env:
           APP: ${{ inputs.app }}
           VERSION: ${{ steps.ver.outputs.version }}
