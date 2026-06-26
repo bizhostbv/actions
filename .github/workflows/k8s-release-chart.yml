@@ -31,6 +31,7 @@ on:
     secrets:
       gitops_deploy_key: { required: true }
       tag_deploy_key:    { required: false }   # write deploy key on the CALLER's app repo; required when version_from == 'conventional' (pushes the computed vX.Y.Z tag)
+      npm_token:         { required: false }   # read token for a private package registry; mounted into the build as the `npm_token` secret (the Dockerfile uses --mount=type=secret,id=npm_token). Omit if the build needs no registry auth.
 
 concurrency:
   group: release-${{ github.repository }}   # one release at a time per app repo
@@ -149,10 +150,21 @@ jobs:
           VERSION: ${{ steps.ver.outputs.version }}
           DOCKERFILE: ${{ inputs.dockerfile }}
           CONTEXT: ${{ inputs.context }}
+          NPM_TOKEN: ${{ secrets.npm_token }}
         run: |
           set -euo pipefail
           IMG="$REGISTRY/$PROJECT/$APP:$VERSION"
-          buildah bud --layers --isolation chroot -f "$DOCKERFILE" -t "$IMG" "$CONTEXT"
+          # Optionally expose a registry read-token to the build as the `npm_token`
+          # secret (Dockerfile: --mount=type=secret,id=npm_token). Without the secret,
+          # the build command is byte-for-byte what it was before.
+          SECRET_ARGS=()
+          if [ -n "${NPM_TOKEN:-}" ]; then
+            trap 'rm -f /tmp/npm_token' EXIT
+            install -m600 /dev/null /tmp/npm_token
+            printf '%s' "$NPM_TOKEN" > /tmp/npm_token
+            SECRET_ARGS=(--secret id=npm_token,src=/tmp/npm_token)
+          fi
+          buildah bud --layers --isolation chroot "${SECRET_ARGS[@]}" -f "$DOCKERFILE" -t "$IMG" "$CONTEXT"
           buildah push "$IMG"   # Harbor creds pre-stored on the host
 
       - name: Package & push immutable chart (image tag baked in)
