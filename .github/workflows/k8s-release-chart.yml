@@ -41,6 +41,7 @@ concurrency:
 # everything else (registry push, gitops push) uses host creds + the deploy key.
 permissions:
   contents: read
+  packages: read   # the build can read GitHub Packages with the workflow's own token (npm_token fallback)
 
 jobs:
   release:
@@ -150,7 +151,11 @@ jobs:
           VERSION: ${{ steps.ver.outputs.version }}
           DOCKERFILE: ${{ inputs.dockerfile }}
           CONTEXT: ${{ inputs.context }}
-          NPM_TOKEN: ${{ secrets.npm_token }}
+          # Use an explicit npm_token if the caller passes one, else fall back to the
+          # workflow's own GITHUB_TOKEN (packages:read) — so a caller can install a private
+          # GitHub Packages dep without minting/passing a PAT. (GITHUB_TOKEN is reserved and
+          # cannot be passed by a caller as a secret, so the fallback is resolved here.)
+          NPM_TOKEN: ${{ secrets.npm_token || github.token }}
         run: |
           set -euo pipefail
           IMG="$REGISTRY/$PROJECT/$APP:$VERSION"
