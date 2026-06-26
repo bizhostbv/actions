@@ -162,7 +162,7 @@ jobs:
             trap 'rm -f /tmp/npm_token' EXIT
             install -m600 /dev/null /tmp/npm_token
             printf '%s' "$NPM_TOKEN" > /tmp/npm_token
-            SECRET_ARGS=(--secret id=npm_token,src=/tmp/npm_token)
+            SECRET_ARGS=(--secret "id=npm_token,src=/tmp/npm_token")
           fi
           buildah bud --layers --isolation chroot "${SECRET_ARGS[@]}" -f "$DOCKERFILE" -t "$IMG" "$CONTEXT"
           buildah push "$IMG"   # Harbor creds pre-stored on the host
