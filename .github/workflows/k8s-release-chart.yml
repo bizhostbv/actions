@@ -51,7 +51,7 @@ jobs:
         with:
           # full history + tags ONLY for conventional versioning; branch mode keeps the
           # previous shallow checkout, so existing @v1 callers are byte-for-byte unchanged.
-          fetch-depth: ${{ inputs.version_from == 'conventional' && 0 || 1 }}
+          fetch-depth: ${{ inputs.version_from == 'conventional' && '0' || '1' }}
 
       - name: Derive & validate version
         id: ver
