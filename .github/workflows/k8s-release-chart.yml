@@ -169,7 +169,7 @@ jobs:
             printf '%s' "$NPM_TOKEN" > /tmp/npm_token
             SECRET_ARGS=(--secret "id=npm_token,src=/tmp/npm_token")
           fi
-          buildah bud --layers --isolation chroot "${SECRET_ARGS[@]}" -f "$DOCKERFILE" -t "$IMG" "$CONTEXT"
+          buildah bud --layers --isolation chroot --ulimit nofile=65536:65536 "${SECRET_ARGS[@]}" -f "$DOCKERFILE" -t "$IMG" "$CONTEXT"
           buildah push "$IMG"   # Harbor creds pre-stored on the host
 
       - name: Package & push immutable chart (image tag baked in)
