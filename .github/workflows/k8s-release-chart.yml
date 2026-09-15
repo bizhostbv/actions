@@ -27,6 +27,10 @@ on:
       chart_dir:    { required: false, type: string, default: chart }
       registry:     { required: false, type: string, default: harbor.k8s-hotel.nl }
       gitops_repo:  { required: false, type: string, default: "git@github.com:globalcontrolgroup/gcg-shop-gitops.git" }
+      # The Application file in the gitops repo whose spec.sources[0].targetRevision is bumped.
+      # Default: apps/acc/<app>.yaml (the hotel layout). An application that lives on another
+      # cluster names its own file, e.g. gwsn/<app>/argocd/acceptance.yaml (15 September 2026).
+      gitops_app_file: { required: false, type: string, default: "" }
       version_from: { required: false, type: string, default: branch }                 # 'branch' (release/vX.Y.Z) | 'conventional'
     secrets:
       gitops_deploy_key: { required: true }
@@ -196,6 +200,7 @@ jobs:
           VERSION: ${{ steps.ver.outputs.version }}
           APP: ${{ inputs.app }}
           GITOPS_REPO: ${{ inputs.gitops_repo }}
+          GITOPS_APP_FILE: ${{ inputs.gitops_app_file }}
           GITOPS_KEY: ${{ secrets.gitops_deploy_key }}
         run: |
           set -euo pipefail
@@ -205,10 +210,12 @@ jobs:
           # closing the first-connection MITM window on a push that carries the deploy key.
           printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > /tmp/gitops-known_hosts
           rm -rf /tmp/gitops && git clone "$GITOPS_REPO" /tmp/gitops
-          yq -i ".spec.sources[0].targetRevision = \"$VERSION\"" "/tmp/gitops/apps/acc/$APP.yaml"
+          FILE="${GITOPS_APP_FILE:-apps/acc/$APP.yaml}"
+          test -f "/tmp/gitops/$FILE" || { echo "::error::$FILE does not exist in $GITOPS_REPO — pass gitops_app_file for an application that does not live under apps/acc/"; exit 1; }
+          yq -i ".spec.sources[0].targetRevision = \"$VERSION\"" "/tmp/gitops/$FILE"
           git -C /tmp/gitops config user.name 'gitops-ci'
           git -C /tmp/gitops config user.email 'gitops-ci@k8s-hotel'
-          git -C /tmp/gitops commit -am "release(acc/$APP): chart $VERSION"
+          git -C /tmp/gitops commit -am "release($APP): chart $VERSION in $FILE"
           git -C /tmp/gitops push
 
       - name: Summary
