@@ -215,7 +215,8 @@ jobs:
           yq -i ".spec.sources[0].targetRevision = \"$VERSION\"" "/tmp/gitops/$FILE"
           git -C /tmp/gitops config user.name 'gitops-ci'
           git -C /tmp/gitops config user.email 'gitops-ci@k8s-hotel'
-          git -C /tmp/gitops commit -am "release($APP): chart $VERSION in $FILE"
+          if [ -z "$GITOPS_APP_FILE" ]; then MSG="release(acc/$APP): chart $VERSION"; else MSG="release($APP): chart $VERSION in $FILE"; fi
+          git -C /tmp/gitops commit -am "$MSG"
           git -C /tmp/gitops push
 
       - name: Summary
