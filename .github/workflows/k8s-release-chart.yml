@@ -173,7 +173,15 @@ jobs:
             printf '%s' "$NPM_TOKEN" > /tmp/npm_token
             SECRET_ARGS=(--secret "id=npm_token,src=/tmp/npm_token")
           fi
-          buildah bud --layers --isolation chroot --ulimit nofile=65536:65536 "${SECRET_ARGS[@]}" -f "$DOCKERFILE" -t "$IMG" "$CONTEXT"
+          # Build metadata for the image's version endpoint. A Dockerfile that declares
+          # these ARGs gets them; one that does not only sees a buildah warning about an
+          # unused build arg — the image is otherwise byte-for-byte what it was before.
+          BUILD_META_ARGS=(
+            --build-arg "APP_BUILD_SHA=${GITHUB_SHA}"
+            --build-arg "APP_BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            --build-arg "APP_BUILD_VERSION=${VERSION}"
+          )
+          buildah bud --layers --isolation chroot --ulimit nofile=65536:65536 "${SECRET_ARGS[@]}" "${BUILD_META_ARGS[@]}" -f "$DOCKERFILE" -t "$IMG" "$CONTEXT"
           buildah push "$IMG"   # Harbor creds pre-stored on the host
 
       - name: Package & push immutable chart (image tag baked in)
