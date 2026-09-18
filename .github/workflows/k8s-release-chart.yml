@@ -43,9 +43,15 @@ concurrency:
 
 # checkout needs contents:read to clone this (private) repo via GITHUB_TOKEN;
 # everything else (registry push, gitops push) uses host creds + the deploy key.
+#
+# No packages:read here on purpose (removed 18 September 2026): a workflow_call's permissions
+# block cannot exceed what the CALLER grants, so a caller whose own job only sets
+# `permissions: contents: read` — every caller who never touched this, i.e. most of them —
+# got a startup_failure the moment this workflow asked for packages:read too. A caller that
+# wants the npm_token GITHUB_TOKEN-fallback below (see NPM_TOKEN) grants packages:read itself,
+# on its own calling job, exactly like an explicit npm_token secret is its own opt-in.
 permissions:
   contents: read
-  packages: read   # the build can read GitHub Packages with the workflow's own token (npm_token fallback)
 
 jobs:
   release:
