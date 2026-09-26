@@ -12,6 +12,10 @@ on:
       acc_registry:  { required: false, type: string, default: harbor.k8s-hotel.nl }
       prod_registry: { required: false, type: string, default: registry.k8s-bizhost.nl }
       gitops_repo:   { required: false, type: string, default: "git@github.com:globalcontrolgroup/gcg-shop-gitops.git" }
+      # Path of the prod ArgoCD Application in the gitops repo. Empty keeps the old
+      # layout, apps/prod/<app>.yaml; a repo with another layout names its file here,
+      # the same way k8s-release-chart takes gitops_app_file for acc.
+      gitops_app_file: { required: false, type: string, default: "" }
     secrets:
       gitops_deploy_key: { required: true }
 
@@ -60,7 +64,9 @@ jobs:
           # Promote the immutable Helm chart artifact too (charts per version in Harbor).
           CSRC="docker://$ACC_REGISTRY/$PROJECT/charts/$APP:$VERSION"
           CDST="docker://$PROD_REGISTRY/$PROJECT/charts/$APP:$VERSION"
-          skopeo inspect "$CSRC" >/dev/null || { echo "::error::acc chart $CSRC not found"; exit 1; }
+          # --raw: a Helm chart is an OCI artifact, not an image, and a plain inspect
+          # fails on it with "unsupported image-specific operation" even when it exists.
+          skopeo inspect --raw "$CSRC" >/dev/null || { echo "::error::acc chart $CSRC not found"; exit 1; }
           skopeo copy --all "$CSRC" "$CDST"
 
       - name: Stage prod chart-version bump in gitops (branch + push; PR is human-merged)
@@ -70,6 +76,7 @@ jobs:
           APP: ${{ inputs.app }}
           GITOPS_REPO: ${{ inputs.gitops_repo }}
           GITOPS_KEY: ${{ secrets.gitops_deploy_key }}
+          APP_FILE: ${{ inputs.gitops_app_file }}
         run: |
           set -euo pipefail
           trap 'rm -f /tmp/gitops-ci /tmp/gitops-known_hosts' EXIT
@@ -81,7 +88,9 @@ jobs:
           rm -rf /tmp/gitops && git clone "$GITOPS_REPO" /tmp/gitops
           br="promote/$APP-$VERSION"
           git -C /tmp/gitops switch -c "$br"
-          yq -i ".spec.sources[0].targetRevision = \"$VERSION\"" "/tmp/gitops/apps/prod/$APP.yaml"
+          file="${APP_FILE:-apps/prod/$APP.yaml}"
+          test -f "/tmp/gitops/$file" || { echo "::error::$file does not exist in the gitops repo"; exit 1; }
+          yq -i ".spec.sources[0].targetRevision = \"$VERSION\"" "/tmp/gitops/$file"
           git -C /tmp/gitops config user.name 'gitops-ci'
           git -C /tmp/gitops config user.email 'gitops-ci@k8s-hotel'
           git -C /tmp/gitops commit -am "promote(prod/$APP): $VERSION"
