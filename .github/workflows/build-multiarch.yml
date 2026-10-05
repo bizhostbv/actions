@@ -3,14 +3,13 @@ name: build-multiarch
 # architecture is built natively (no QEMU) on its own self-hosted runner, then a manifest list
 # joins the two under :<tag>:
 #
-#   build (amd64)  runs-on: [self-hosted, harbor-builder]        -> <registry>/<image>:amd64-<tag>
-#   build (arm64)  runs-on: [self-hosted, harbor-builder-arm64]  -> <registry>/<image>:arm64-<tag>
+#   build (amd64)  runs-on: [self-hosted, harbor-builder]        -> <registry>/<image>@<digest>
+#   build (arm64)  runs-on: [self-hosted, harbor-builder-arm64]  -> <registry>/<image>@<digest>
 #   manifest       runs-on: [self-hosted, harbor-builder]        -> <registry>/<image>:<tag>
 #
 # Both organisations (bizhostbv, globalcontrolgroup) have runners with exactly these labels, so a
-# caller in either needs nothing organisation-specific. The per-arch tags carry the arch as a
-# PREFIX on purpose: a Harbor immutable-tag rule like `[0-9]*.[0-9]*.[0-9]*` would also match
-# `1.2.3-amd64` and block a rerun after a failed manifest step.
+# caller in either needs nothing organisation-specific. The two halves are pushed by digest, without
+# a tag: the only tag is <tag> itself, and each node pulls its own architecture from it.
 #
 # Use it from any repo:
 #
@@ -100,14 +99,27 @@ jobs:
           BUILD_ARGS: ${{ inputs.build_args }}
         run: |
           set -euo pipefail
-          IMG="$REGISTRY/$IMAGE:$ARCH-$TAG"
+          IMG="localhost/build:$ARCH"
           BA=(); for kv in $BUILD_ARGS; do BA+=(--build-arg "$kv"); done
           buildah bud --layers --isolation chroot --ulimit nofile=65536:65536 "${BA[@]}" -f "$DOCKERFILE" -t "$IMG" "$CONTEXT"
           # A runner on the wrong architecture would silently push a mislabelled image.
           GOT=$(buildah inspect --format '{{.OCIv1.Architecture}}' "$IMG")
           [ "$GOT" = "$ARCH" ] || { echo "::error::built $GOT on the $ARCH runner"; exit 1; }
-          CREDS=(); [ -n "${REG_USER:-}" ] && CREDS=(--creds "$REG_USER:$REG_PASS")
-          buildah push "${CREDS[@]}" "$IMG"
+          # Push by digest, without a tag: through an OCI layout, whose manifest digest skopeo
+          # keeps (--preserve-digests), so the digest is known before it reaches the registry.
+          OCI="$RUNNER_TEMP/oci-$ARCH"; rm -rf "$OCI"
+          buildah push --digestfile "$RUNNER_TEMP/digest-$ARCH" "$IMG" "oci:$OCI:$ARCH"
+          CREDS=(); [ -n "${REG_USER:-}" ] && CREDS=(--dest-creds "$REG_USER:$REG_PASS")
+          skopeo copy --preserve-digests "${CREDS[@]}" "oci:$OCI:$ARCH" "docker://$REGISTRY/$IMAGE@$(cat "$RUNNER_TEMP/digest-$ARCH")"
+          rm -rf "$OCI"
+
+      # The digest is the only handle on the untagged half; hand it to the manifest job.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digest-${{ matrix.arch }}
+          retention-days: 1
+          overwrite: true   # a re-run of a failed job uploads again
 
   manifest:
     needs: build
@@ -116,6 +128,12 @@ jobs:
       image: ${{ steps.push.outputs.image }}
       digest: ${{ steps.push.outputs.digest }}
     steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/digests
+
       - name: Join amd64 + arm64 into one multi-arch tag
         id: push
         run: |
@@ -125,7 +143,7 @@ jobs:
           buildah manifest rm "$LIST" >/dev/null 2>&1 || true
           buildah manifest create "$LIST" >/dev/null
           for ARCH in amd64 arm64; do
-            buildah manifest add "${CREDS[@]}" "$LIST" "docker://$REGISTRY/$IMAGE:$ARCH-$TAG" >/dev/null
+            buildah manifest add "${CREDS[@]}" "$LIST" "docker://$REGISTRY/$IMAGE@$(cat "$RUNNER_TEMP/digests/digest-$ARCH")" >/dev/null
           done
           buildah manifest push "${CREDS[@]}" --all --digestfile /tmp/digest "$LIST" "docker://$REGISTRY/$IMAGE:$TAG"
           buildah manifest rm "$LIST" >/dev/null

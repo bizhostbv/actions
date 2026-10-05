@@ -39,8 +39,9 @@ runners with the same labels, so callers need nothing organisation-specific:
 | `[self-hosted, harbor-builder]` | amd64 buildah runner (`<org>-harbor-builder`) |
 | `[self-hosted, harbor-builder-arm64]` | arm64 buildah runner (`<org>-harbor-builder-arm`) |
 
-- `k8s-release-chart.yml@v3`: same inputs and secrets as v2; only the image is now multi-arch.
-  Migrating is changing `@v1`/`@v2` into `@v3`.
+- `k8s-release.yml@v3` and `k8s-release-chart.yml@v3`: same inputs and secrets as before; only the
+  image is now multi-arch. Migrating is changing `@v1`/`@v2` into `@v3`. `k8s-promote.yml` and
+  `ci-checks.yml` are unchanged (promote already copies with `skopeo copy --all`).
 - `build-multiarch.yml@v3`: just build + push one multi-arch image, for images without a chart
   (base images, tools). Registry defaults to `registry.k8s-bizhost.nl`; pass `registry:
   harbor.k8s-hotel.nl` for Harbor.
@@ -57,6 +58,5 @@ jobs:
       registry_password: ${{ secrets.REGISTRY_PASSWORD }}
 ```
 
-Next to `:X.Y.Z` the registry gets `:amd64-X.Y.Z` and `:arm64-X.Y.Z` (the per-arch halves; the arch
-is a prefix so Harbor's immutable rule `[0-9]*.[0-9]*.[0-9]*` doesn't lock them before the manifest
-list exists). Deploy `:X.Y.Z`.
+The two architectures are pushed by digest, without a tag: `:X.Y.Z` is the only tag, and each node
+pulls its own architecture from it. Deploy `:X.Y.Z` as before.

@@ -17,12 +17,11 @@ name: k8s-release-chart
 # Multi-arch (v3): the image is built natively for linux/amd64 and linux/arm64 and pushed as one
 # manifest list :X.Y.Z, so it runs on both node pools:
 #   version          [self-hosted, harbor-builder]        version, validation, immutability guard
-#   build (amd64)    [self-hosted, harbor-builder]        :amd64-X.Y.Z
-#   build (arm64)    [self-hosted, harbor-builder-arm64]  :arm64-X.Y.Z
+#   build (amd64)    [self-hosted, harbor-builder]        image by digest, untagged
+#   build (arm64)    [self-hosted, harbor-builder-arm64]  image by digest, untagged
 #   release          [self-hosted, harbor-builder]        manifest list :X.Y.Z, chart, gitops bump
-# The arch goes in front of the version on purpose: Harbor's immutable rule `[0-9]*.[0-9]*.[0-9]*`
-# would also match X.Y.Z-amd64 and block a rerun. build-multiarch.yml builds the same way; keep
-# the "Build & push" steps of both in sync.
+# :X.Y.Z is the only tag; each node pulls its own architecture from it. build-multiarch.yml builds
+# the same way; keep the "Build & push" steps of both in sync.
 #
 # Runner prerequisites (pre-stored on the self-hosted runners, never GITHUB_TOKEN), on both the
 # amd64 and the arm64 runners:
@@ -195,7 +194,7 @@ jobs:
           NPM_TOKEN: ${{ secrets.npm_token || github.token }}
         run: |
           set -euo pipefail
-          IMG="$REGISTRY/$PROJECT/$APP:$ARCH-$VERSION"
+          IMG="localhost/build:$ARCH"
           # Optionally expose a registry read-token to the build as the `npm_token`
           # secret (Dockerfile: --mount=type=secret,id=npm_token).
           SECRET_ARGS=()
@@ -217,13 +216,32 @@ jobs:
           # A runner on the wrong architecture would silently push a mislabelled image.
           GOT=$(buildah inspect --format '{{.OCIv1.Architecture}}' "$IMG")
           [ "$GOT" = "$ARCH" ] || { echo "::error::built $GOT on the $ARCH runner"; exit 1; }
-          buildah push "$IMG"   # registry creds pre-stored on the runner
+          # Push by digest, without a tag: through an OCI layout, whose manifest digest skopeo
+          # keeps (--preserve-digests), so the digest is known before it reaches the registry.
+          OCI="$RUNNER_TEMP/oci-$ARCH"; rm -rf "$OCI"
+          buildah push --digestfile "$RUNNER_TEMP/digest-$ARCH" "$IMG" "oci:$OCI:$ARCH"
+          skopeo copy --preserve-digests "oci:$OCI:$ARCH" "docker://$REGISTRY/$PROJECT/$APP@$(cat "$RUNNER_TEMP/digest-$ARCH")"   # registry creds pre-stored on the runner
+          rm -rf "$OCI"
+
+      # The digest is the only handle on the untagged half; hand it to the manifest job.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digest-${{ matrix.arch }}
+          retention-days: 1
+          overwrite: true   # a re-run of a failed job uploads again
 
   release:
     needs: [version, build]
     runs-on: [self-hosted, harbor-builder]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/digests
 
       - name: Join amd64 + arm64 into the immutable multi-arch image
         env:
@@ -238,7 +256,7 @@ jobs:
           buildah manifest rm "$LIST" >/dev/null 2>&1 || true
           buildah manifest create "$LIST" >/dev/null
           for ARCH in amd64 arm64; do
-            buildah manifest add "$LIST" "docker://$REGISTRY/$PROJECT/$APP:$ARCH-$VERSION" >/dev/null
+            buildah manifest add "$LIST" "docker://$REGISTRY/$PROJECT/$APP@$(cat "$RUNNER_TEMP/digests/digest-$ARCH")" >/dev/null
           done
           buildah manifest push --all "$LIST" "docker://$IMG"   # registry creds pre-stored on the runner
           buildah manifest rm "$LIST" >/dev/null

@@ -2,6 +2,10 @@ name: k8s-release
 # Reusable immutable release pipeline for any container app on K8s.
 # Caller triggers on push to release/vX.Y.Z. Build one immutable :X.Y.Z, push it,
 # then write that tag into the GitOps repo (acc) so ArgoCD auto-syncs. No moving tags.
+#
+# Multi-arch (v3): :X.Y.Z is a manifest list of a native linux/amd64 build on
+# [self-hosted, harbor-builder] and a native linux/arm64 build on [self-hosted, harbor-builder-arm64],
+# both pushed by digest (untagged). Same flow as build-multiarch.yml; keep the build steps in sync.
 on:
   workflow_call:
     inputs:
@@ -24,13 +28,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
+  version:
     runs-on: [self-hosted, harbor-builder]
     env:
       HARBOR_USER: ${{ secrets.harbor_username }}    # robot$name — kept in env so the shell never re-expands the '$'
       HARBOR_TOKEN: ${{ secrets.harbor_token }}
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      registry: ${{ steps.ver.outputs.registry }}
+      image: ${{ steps.ver.outputs.image }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1   # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Derive & validate version + resolve registry
         id: ver
@@ -54,14 +62,80 @@ jobs:
             echo "::error::${{ steps.ver.outputs.image }} already exists — versions are immutable. Bump the semver."; exit 1
           fi
 
-      - name: Build & push immutable image
+  build:
+    needs: version
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { arch: amd64, runner: harbor-builder }
+          - { arch: arm64, runner: harbor-builder-arm64 }
+    runs-on: [self-hosted, "${{ matrix.runner }}"]
+    env:
+      HARBOR_USER: ${{ secrets.harbor_username }}    # robot$name — kept in env so the shell never re-expands the '$'
+      HARBOR_TOKEN: ${{ secrets.harbor_token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build & push ${{ matrix.arch }} image (by digest)
+        env:
+          ARCH: ${{ matrix.arch }}
+          REPO: ${{ needs.version.outputs.registry }}/${{ inputs.project }}/${{ inputs.app }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          CONTEXT: ${{ inputs.context }}
+          BUILD_ARGS: ${{ inputs.build_args }}
         run: |
           set -euo pipefail
-          BA=""
-          for kv in ${{ inputs.build_args }}; do BA="$BA --build-arg $kv"; done
-          buildah bud --layers --isolation chroot $BA \
-            -f "${{ inputs.dockerfile }}" -t "${{ steps.ver.outputs.image }}" "${{ inputs.context }}"
-          buildah push --creds "$HARBOR_USER:$HARBOR_TOKEN" "${{ steps.ver.outputs.image }}"
+          IMG="localhost/build:$ARCH"
+          BA=(); for kv in $BUILD_ARGS; do BA+=(--build-arg "$kv"); done
+          buildah bud --layers --isolation chroot "${BA[@]}" -f "$DOCKERFILE" -t "$IMG" "$CONTEXT"
+          # A runner on the wrong architecture would silently push a mislabelled image.
+          GOT=$(buildah inspect --format '{{.OCIv1.Architecture}}' "$IMG")
+          [ "$GOT" = "$ARCH" ] || { echo "::error::built $GOT on the $ARCH runner"; exit 1; }
+          # Push by digest, without a tag: through an OCI layout, whose manifest digest skopeo
+          # keeps (--preserve-digests), so the digest is known before it reaches the registry.
+          OCI="$RUNNER_TEMP/oci-$ARCH"; rm -rf "$OCI"
+          buildah push --digestfile "$RUNNER_TEMP/digest-$ARCH" "$IMG" "oci:$OCI:$ARCH"
+          skopeo copy --preserve-digests --dest-creds "$HARBOR_USER:$HARBOR_TOKEN" "oci:$OCI:$ARCH" "docker://$REPO@$(cat "$RUNNER_TEMP/digest-$ARCH")"
+          rm -rf "$OCI"
+
+      # The digest is the only handle on the untagged half; hand it to the release job.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digest-${{ matrix.arch }}
+          retention-days: 1
+          overwrite: true   # a re-run of a failed job uploads again
+
+  release:
+    needs: [version, build]
+    runs-on: [self-hosted, harbor-builder]
+    env:
+      HARBOR_USER: ${{ secrets.harbor_username }}    # robot$name — kept in env so the shell never re-expands the '$'
+      HARBOR_TOKEN: ${{ secrets.harbor_token }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/digests
+
+      - name: Join amd64 + arm64 into the immutable multi-arch image
+        env:
+          REPO: ${{ needs.version.outputs.registry }}/${{ inputs.project }}/${{ inputs.app }}
+          IMG: ${{ needs.version.outputs.image }}
+        run: |
+          set -euo pipefail
+          LIST="release-$GITHUB_RUN_ID"
+          buildah manifest rm "$LIST" >/dev/null 2>&1 || true
+          buildah manifest create "$LIST" >/dev/null
+          for ARCH in amd64 arm64; do
+            buildah manifest add --creds "$HARBOR_USER:$HARBOR_TOKEN" "$LIST" "docker://$REPO@$(cat "$RUNNER_TEMP/digests/digest-$ARCH")" >/dev/null
+          done
+          buildah manifest push --all --creds "$HARBOR_USER:$HARBOR_TOKEN" "$LIST" "docker://$IMG"
+          buildah manifest rm "$LIST" >/dev/null
+          PLATFORMS=$(skopeo inspect --raw --creds "$HARBOR_USER:$HARBOR_TOKEN" "docker://$IMG" | jq -r '[.manifests[].platform.architecture] | sort | join(",")')
+          [ "$PLATFORMS" = "amd64,arm64" ] || { echo "::error::$IMG has '$PLATFORMS', expected amd64,arm64"; exit 1; }
 
       - name: Write immutable tag into GitOps (acc) — race-safe
         env:
@@ -80,9 +154,9 @@ jobs:
           for attempt in 1 2 3 4 5; do
             git fetch -q origin main
             git reset --hard -q origin/main
-            "$YQ" -i "${{ inputs.tag_key }} = \"${{ steps.ver.outputs.version }}\"" "$VF"
-            if git diff --quiet; then echo "tag already ${{ steps.ver.outputs.version }}"; pushed=1; break; fi
-            git commit -aqm "release(acc/${{ inputs.app }}): ${{ steps.ver.outputs.version }}"
+            "$YQ" -i "${{ inputs.tag_key }} = \"${{ needs.version.outputs.version }}\"" "$VF"
+            if git diff --quiet; then echo "tag already ${{ needs.version.outputs.version }}"; pushed=1; break; fi
+            git commit -aqm "release(acc/${{ inputs.app }}): ${{ needs.version.outputs.version }}"
             if git push -q origin HEAD:main; then echo "pushed on attempt $attempt"; pushed=1; break; fi
             echo "push race, retry $attempt"; sleep $((RANDOM % 4 + 1))
           done
@@ -90,4 +164,4 @@ jobs:
           [ "$pushed" = 1 ] || { echo "::error::Could not write tag to gitops after retries"; exit 1; }
 
       - name: Summary
-        run: echo "Released ${{ steps.ver.outputs.image }} -> acc via gitops (ArgoCD auto-syncs). Promote to prod via reviewed gitops PR." >> "$GITHUB_STEP_SUMMARY"
+        run: echo "Released ${{ needs.version.outputs.image }} -> acc via gitops (ArgoCD auto-syncs). Promote to prod via reviewed gitops PR." >> "$GITHUB_STEP_SUMMARY"
