@@ -14,7 +14,18 @@ name: k8s-release-chart
 #                           commits releases nothing. This keeps the workflow at contents:read
 #                           (the deploy key, not the GITHUB_TOKEN, pushes the tag).
 #
-# Runner prerequisites (pre-stored on the self-hosted host, never GITHUB_TOKEN):
+# Multi-arch (v3): the image is built natively for linux/amd64 and linux/arm64 and pushed as one
+# manifest list :X.Y.Z, so it runs on both node pools:
+#   version          [self-hosted, harbor-builder]        version, validation, immutability guard
+#   build (amd64)    [self-hosted, harbor-builder]        :amd64-X.Y.Z
+#   build (arm64)    [self-hosted, harbor-builder-arm64]  :arm64-X.Y.Z
+#   release          [self-hosted, harbor-builder]        manifest list :X.Y.Z, chart, gitops bump
+# The arch goes in front of the version on purpose: Harbor's immutable rule `[0-9]*.[0-9]*.[0-9]*`
+# would also match X.Y.Z-amd64 and block a rerun. build-multiarch.yml builds the same way; keep
+# the "Build & push" steps of both in sync.
+#
+# Runner prerequisites (pre-stored on the self-hosted runners, never GITHUB_TOKEN), on both the
+# amd64 and the arm64 runners:
 #   - buildah login <registry>      (image push)
 #   - helm registry login <registry>  (OCI chart push)
 on:
@@ -54,13 +65,16 @@ permissions:
   contents: read
 
 jobs:
-  release:
+  version:
     runs-on: [self-hosted, harbor-builder]
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      released: ${{ steps.ver.outputs.released }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # full history + tags ONLY for conventional versioning; branch mode keeps the
-          # previous shallow checkout, so existing @v1 callers are byte-for-byte unchanged.
+          # shallow checkout.
           fetch-depth: ${{ inputs.version_from == 'conventional' && '0' || '1' }}
 
       - name: Derive & validate version
@@ -152,13 +166,26 @@ jobs:
             echo "::error::chart $REGISTRY/$PROJECT/charts/$APP:$VERSION already exists — versions are immutable. Bump the semver."; exit 1
           fi
 
-      - name: Build & push immutable image
-        if: steps.ver.outputs.released == 'true'
+  build:
+    needs: version
+    if: needs.version.outputs.released == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { arch: amd64, runner: harbor-builder }
+          - { arch: arm64, runner: harbor-builder-arm64 }
+    runs-on: [self-hosted, "${{ matrix.runner }}"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build & push ${{ matrix.arch }} image
         env:
+          ARCH: ${{ matrix.arch }}
           REGISTRY: ${{ inputs.registry }}
           PROJECT: ${{ inputs.project }}
           APP: ${{ inputs.app }}
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: ${{ needs.version.outputs.version }}
           DOCKERFILE: ${{ inputs.dockerfile }}
           CONTEXT: ${{ inputs.context }}
           # Use an explicit npm_token if the caller passes one, else fall back to the
@@ -168,10 +195,9 @@ jobs:
           NPM_TOKEN: ${{ secrets.npm_token || github.token }}
         run: |
           set -euo pipefail
-          IMG="$REGISTRY/$PROJECT/$APP:$VERSION"
+          IMG="$REGISTRY/$PROJECT/$APP:$ARCH-$VERSION"
           # Optionally expose a registry read-token to the build as the `npm_token`
-          # secret (Dockerfile: --mount=type=secret,id=npm_token). Without the secret,
-          # the build command is byte-for-byte what it was before.
+          # secret (Dockerfile: --mount=type=secret,id=npm_token).
           SECRET_ARGS=()
           if [ -n "${NPM_TOKEN:-}" ]; then
             trap 'rm -f /tmp/npm_token' EXIT
@@ -181,22 +207,50 @@ jobs:
           fi
           # Build metadata for the image's version endpoint. A Dockerfile that declares
           # these ARGs gets them; one that does not only sees a buildah warning about an
-          # unused build arg — the image is otherwise byte-for-byte what it was before.
+          # unused build arg.
           BUILD_META_ARGS=(
             --build-arg "APP_BUILD_SHA=${GITHUB_SHA}"
             --build-arg "APP_BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             --build-arg "APP_BUILD_VERSION=${VERSION}"
           )
           buildah bud --layers --isolation chroot --ulimit nofile=65536:65536 "${SECRET_ARGS[@]}" "${BUILD_META_ARGS[@]}" -f "$DOCKERFILE" -t "$IMG" "$CONTEXT"
-          buildah push "$IMG"   # Harbor creds pre-stored on the host
+          # A runner on the wrong architecture would silently push a mislabelled image.
+          GOT=$(buildah inspect --format '{{.OCIv1.Architecture}}' "$IMG")
+          [ "$GOT" = "$ARCH" ] || { echo "::error::built $GOT on the $ARCH runner"; exit 1; }
+          buildah push "$IMG"   # registry creds pre-stored on the runner
 
-      - name: Package & push immutable chart (image tag baked in)
-        if: steps.ver.outputs.released == 'true'
+  release:
+    needs: [version, build]
+    runs-on: [self-hosted, harbor-builder]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Join amd64 + arm64 into the immutable multi-arch image
         env:
           REGISTRY: ${{ inputs.registry }}
           PROJECT: ${{ inputs.project }}
           APP: ${{ inputs.app }}
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          IMG="$REGISTRY/$PROJECT/$APP:$VERSION"
+          LIST="release-$GITHUB_RUN_ID"
+          buildah manifest rm "$LIST" >/dev/null 2>&1 || true
+          buildah manifest create "$LIST" >/dev/null
+          for ARCH in amd64 arm64; do
+            buildah manifest add "$LIST" "docker://$REGISTRY/$PROJECT/$APP:$ARCH-$VERSION" >/dev/null
+          done
+          buildah manifest push --all "$LIST" "docker://$IMG"   # registry creds pre-stored on the runner
+          buildah manifest rm "$LIST" >/dev/null
+          PLATFORMS=$(skopeo inspect --raw "docker://$IMG" | jq -r '[.manifests[].platform.architecture] | sort | join(",")')
+          [ "$PLATFORMS" = "amd64,arm64" ] || { echo "::error::$IMG has '$PLATFORMS', expected amd64,arm64"; exit 1; }
+
+      - name: Package & push immutable chart (image tag baked in)
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          PROJECT: ${{ inputs.project }}
+          APP: ${{ inputs.app }}
+          VERSION: ${{ needs.version.outputs.version }}
           CHART_DIR: ${{ inputs.chart_dir }}
         run: |
           set -euo pipefail
@@ -208,10 +262,9 @@ jobs:
           helm push "/tmp/chartpkg/$APP-$VERSION.tgz" "oci://$REGISTRY/$PROJECT/charts"   # helm registry login pre-stored on host
 
       - name: Bump acc Application chart targetRevision in gitops (acc auto-syncs)
-        if: steps.ver.outputs.released == 'true'
         env:
           GIT_SSH_COMMAND: ssh -i /tmp/gitops-ci -o IdentitiesOnly=yes -o UserKnownHostsFile=/tmp/gitops-known_hosts -o StrictHostKeyChecking=yes
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: ${{ needs.version.outputs.version }}
           APP: ${{ inputs.app }}
           GITOPS_REPO: ${{ inputs.gitops_repo }}
           GITOPS_APP_FILE: ${{ inputs.gitops_app_file }}
@@ -234,10 +287,9 @@ jobs:
           git -C /tmp/gitops push
 
       - name: Summary
-        if: steps.ver.outputs.released == 'true'
         env:
           APP: ${{ inputs.app }}
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           echo "Released image + chart $APP:$VERSION -> acc (auto-sync)." >> "$GITHUB_STEP_SUMMARY"
           echo "Promote to prod with the k8s-promote workflow + gitops PR + manual Sync." >> "$GITHUB_STEP_SUMMARY"

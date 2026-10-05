@@ -1,0 +1,136 @@
+name: build-multiarch
+# Build one image for linux/amd64 AND linux/arm64 and push it as a single multi-arch tag. Each
+# architecture is built natively (no QEMU) on its own self-hosted runner, then a manifest list
+# joins the two under :<tag>:
+#
+#   build (amd64)  runs-on: [self-hosted, harbor-builder]        -> <registry>/<image>:amd64-<tag>
+#   build (arm64)  runs-on: [self-hosted, harbor-builder-arm64]  -> <registry>/<image>:arm64-<tag>
+#   manifest       runs-on: [self-hosted, harbor-builder]        -> <registry>/<image>:<tag>
+#
+# Both organisations (bizhostbv, globalcontrolgroup) have runners with exactly these labels, so a
+# caller in either needs nothing organisation-specific. The per-arch tags carry the arch as a
+# PREFIX on purpose: a Harbor immutable-tag rule like `[0-9]*.[0-9]*.[0-9]*` would also match
+# `1.2.3-amd64` and block a rerun after a failed manifest step.
+#
+# Use it from any repo:
+#
+#   jobs:
+#     image:
+#       uses: bizhostbv/actions/.github/workflows/build-multiarch.yml@v3
+#       with:
+#         image: gcg/node-base          # <project>/<name>
+#         tag: 22.4.0
+#         # registry: harbor.k8s-hotel.nl   (default registry.k8s-bizhost.nl)
+#       secrets:
+#         registry_username: ${{ secrets.REGISTRY_USERNAME }}
+#         registry_password: ${{ secrets.REGISTRY_PASSWORD }}
+#
+# Without the two secrets the push relies on a login pre-stored on the runner (the GCG
+# harbor-builders log in to harbor.k8s-hotel.nl at start; nothing else does).
+#
+# k8s-release-chart.yml builds the same way inline: keep the "Build & push" step of both in sync.
+on:
+  workflow_call:
+    inputs:
+      image:      { required: true,  type: string }                                # <project>/<name>, e.g. gcg/node-base
+      tag:        { required: true,  type: string }                                # e.g. 1.4.0
+      registry:   { required: false, type: string, default: registry.k8s-bizhost.nl }
+      dockerfile: { required: false, type: string, default: Dockerfile }
+      context:    { required: false, type: string, default: . }
+      build_args: { required: false, type: string, default: '' }                   # space-separated KEY=VALUE pairs
+      immutable:  { required: false, type: boolean, default: true }                # fail when <image>:<tag> already exists
+    secrets:
+      registry_username: { required: false }
+      registry_password: { required: false }
+    outputs:
+      image:  { description: "<registry>/<image>:<tag>", value: "${{ jobs.manifest.outputs.image }}" }
+      digest: { description: "digest of the manifest list", value: "${{ jobs.manifest.outputs.digest }}" }
+
+concurrency:
+  group: build-multiarch-${{ github.repository }}-${{ inputs.image }}-${{ inputs.tag }}
+  cancel-in-progress: false
+
+# checkout only; registry auth comes from the secrets or the runner, never the GITHUB_TOKEN.
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ${{ inputs.registry }}
+  IMAGE: ${{ inputs.image }}
+  TAG: ${{ inputs.tag }}
+  REG_USER: ${{ secrets.registry_username }}   # robot$name — kept in env so the shell never re-expands the '$'
+  REG_PASS: ${{ secrets.registry_password }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { arch: amd64, runner: harbor-builder }
+          - { arch: arm64, runner: harbor-builder-arm64 }
+    runs-on: [self-hosted, "${{ matrix.runner }}"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate inputs (they land in registry references)
+        run: |
+          set -euo pipefail
+          printf '%s' "$REGISTRY" | grep -Eq '^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]+)?$' \
+            || { echo "::error::registry must be a host[:port] (got '$REGISTRY')"; exit 1; }
+          printf '%s' "$IMAGE" | grep -Eq '^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)+$' \
+            || { echo "::error::image must be <project>/<name>, lowercase (got '$IMAGE')"; exit 1; }
+          printf '%s' "$TAG" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9._-]{0,120}$' \
+            || { echo "::error::tag is not a valid image tag (got '$TAG')"; exit 1; }
+
+      - name: Guard — tag must not already exist (immutable)
+        if: inputs.immutable
+        run: |
+          set -euo pipefail
+          CREDS=(); [ -n "${REG_USER:-}" ] && CREDS=(--creds "$REG_USER:$REG_PASS")
+          if skopeo inspect --raw "${CREDS[@]}" "docker://$REGISTRY/$IMAGE:$TAG" >/dev/null 2>&1; then
+            echo "::error::$REGISTRY/$IMAGE:$TAG already exists — tags are immutable. Bump the tag."; exit 1
+          fi
+
+      - name: Build & push ${{ matrix.arch }}
+        env:
+          ARCH: ${{ matrix.arch }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          CONTEXT: ${{ inputs.context }}
+          BUILD_ARGS: ${{ inputs.build_args }}
+        run: |
+          set -euo pipefail
+          IMG="$REGISTRY/$IMAGE:$ARCH-$TAG"
+          BA=(); for kv in $BUILD_ARGS; do BA+=(--build-arg "$kv"); done
+          buildah bud --layers --isolation chroot --ulimit nofile=65536:65536 "${BA[@]}" -f "$DOCKERFILE" -t "$IMG" "$CONTEXT"
+          # A runner on the wrong architecture would silently push a mislabelled image.
+          GOT=$(buildah inspect --format '{{.OCIv1.Architecture}}' "$IMG")
+          [ "$GOT" = "$ARCH" ] || { echo "::error::built $GOT on the $ARCH runner"; exit 1; }
+          CREDS=(); [ -n "${REG_USER:-}" ] && CREDS=(--creds "$REG_USER:$REG_PASS")
+          buildah push "${CREDS[@]}" "$IMG"
+
+  manifest:
+    needs: build
+    runs-on: [self-hosted, harbor-builder]
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Join amd64 + arm64 into one multi-arch tag
+        id: push
+        run: |
+          set -euo pipefail
+          CREDS=(); [ -n "${REG_USER:-}" ] && CREDS=(--creds "$REG_USER:$REG_PASS")
+          LIST="build-multiarch-$GITHUB_RUN_ID"
+          buildah manifest rm "$LIST" >/dev/null 2>&1 || true
+          buildah manifest create "$LIST" >/dev/null
+          for ARCH in amd64 arm64; do
+            buildah manifest add "${CREDS[@]}" "$LIST" "docker://$REGISTRY/$IMAGE:$ARCH-$TAG" >/dev/null
+          done
+          buildah manifest push "${CREDS[@]}" --all --digestfile /tmp/digest "$LIST" "docker://$REGISTRY/$IMAGE:$TAG"
+          buildah manifest rm "$LIST" >/dev/null
+          PLATFORMS=$(skopeo inspect --raw "${CREDS[@]}" "docker://$REGISTRY/$IMAGE:$TAG" | jq -r '[.manifests[].platform.architecture] | sort | join(",")')
+          [ "$PLATFORMS" = "amd64,arm64" ] || { echo "::error::manifest list has '$PLATFORMS', expected amd64,arm64"; exit 1; }
+          echo "image=$REGISTRY/$IMAGE:$TAG" >> "$GITHUB_OUTPUT"
+          echo "digest=$(cat /tmp/digest)" >> "$GITHUB_OUTPUT"
+          echo "Pushed $REGISTRY/$IMAGE:$TAG ($(cat /tmp/digest)) for $PLATFORMS." >> "$GITHUB_STEP_SUMMARY"
