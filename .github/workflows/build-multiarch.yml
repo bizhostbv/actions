@@ -113,10 +113,19 @@ jobs:
           skopeo copy --preserve-digests "${CREDS[@]}" "oci:$OCI:$ARCH" "docker://$REGISTRY/$IMAGE@$(cat "$RUNNER_TEMP/digest-$ARCH")"
           rm -rf "$OCI"
 
+      # Artifact names must be unique per image within the whole run: a caller with a matrix
+      # (one call per service) runs this workflow several times in one run, and a shared
+      # name would hand one service's digest to another's manifest job.
+      - name: Artifact key
+        id: key
+        env:
+          REF: "${{ inputs.image }}:${{ inputs.tag }}"
+        run: echo "key=digest-$(printf '%s' "$REF" | tr '/:' '--')" >> "$GITHUB_OUTPUT"
+
       # The digest is the only handle on the untagged half; hand it to the manifest job.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: digest-${{ matrix.arch }}
+          name: ${{ steps.key.outputs.key }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/digest-${{ matrix.arch }}
           retention-days: 1
           overwrite: true   # a re-run of a failed job uploads again
@@ -128,9 +137,18 @@ jobs:
       image: ${{ steps.push.outputs.image }}
       digest: ${{ steps.push.outputs.digest }}
     steps:
+      # Artifact names must be unique per image within the whole run: a caller with a matrix
+      # (one call per service) runs this workflow several times in one run, and a shared
+      # name would hand one service's digest to another's manifest job.
+      - name: Artifact key
+        id: key
+        env:
+          REF: "${{ inputs.image }}:${{ inputs.tag }}"
+        run: echo "key=digest-$(printf '%s' "$REF" | tr '/:' '--')" >> "$GITHUB_OUTPUT"
+
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: digest-*
+          pattern: ${{ steps.key.outputs.key }}-*
           merge-multiple: true
           path: ${{ runner.temp }}/digests
 
