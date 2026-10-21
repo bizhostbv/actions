@@ -69,6 +69,13 @@ jobs:
           - { arch: amd64, runner: harbor-builder }
           - { arch: arm64, runner: harbor-builder-arm64 }
     runs-on: [self-hosted, "${{ matrix.runner }}"]
+    # The digest is the only handle on the untagged half. Each leg sets only its own output
+    # name, and GitHub combines the outputs of all matrix legs, so the next job sees both.
+    # Job outputs, not artifacts: they belong to this call of the workflow (a caller with a
+    # matrix of services cannot mix them up) and they do not count against artifact storage.
+    outputs:
+      digest_amd64: ${{ steps.push.outputs.digest_amd64 }}
+      digest_arm64: ${{ steps.push.outputs.digest_arm64 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -92,6 +99,7 @@ jobs:
           fi
 
       - name: Build & push ${{ matrix.arch }}
+        id: push
         env:
           ARCH: ${{ matrix.arch }}
           DOCKERFILE: ${{ inputs.dockerfile }}
@@ -112,23 +120,7 @@ jobs:
           CREDS=(); [ -n "${REG_USER:-}" ] && CREDS=(--dest-creds "$REG_USER:$REG_PASS")
           skopeo copy --preserve-digests "${CREDS[@]}" "oci:$OCI:$ARCH" "docker://$REGISTRY/$IMAGE@$(cat "$RUNNER_TEMP/digest-$ARCH")"
           rm -rf "$OCI"
-
-      # Artifact names must be unique per image within the whole run: a caller with a matrix
-      # (one call per service) runs this workflow several times in one run, and a shared
-      # name would hand one service's digest to another's manifest job.
-      - name: Artifact key
-        id: key
-        env:
-          REF: "${{ inputs.image }}:${{ inputs.tag }}"
-        run: echo "key=digest-$(printf '%s' "$REF" | tr '/:' '--')" >> "$GITHUB_OUTPUT"
-
-      # The digest is the only handle on the untagged half; hand it to the manifest job.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ${{ steps.key.outputs.key }}-${{ matrix.arch }}
-          path: ${{ runner.temp }}/digest-${{ matrix.arch }}
-          retention-days: 1
-          overwrite: true   # a re-run of a failed job uploads again
+          echo "digest_$ARCH=$(cat "$RUNNER_TEMP/digest-$ARCH")" >> "$GITHUB_OUTPUT"
 
   manifest:
     needs: build
@@ -137,31 +129,20 @@ jobs:
       image: ${{ steps.push.outputs.image }}
       digest: ${{ steps.push.outputs.digest }}
     steps:
-      # Artifact names must be unique per image within the whole run: a caller with a matrix
-      # (one call per service) runs this workflow several times in one run, and a shared
-      # name would hand one service's digest to another's manifest job.
-      - name: Artifact key
-        id: key
-        env:
-          REF: "${{ inputs.image }}:${{ inputs.tag }}"
-        run: echo "key=digest-$(printf '%s' "$REF" | tr '/:' '--')" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: ${{ steps.key.outputs.key }}-*
-          merge-multiple: true
-          path: ${{ runner.temp }}/digests
-
       - name: Join amd64 + arm64 into one multi-arch tag
         id: push
+        env:
+          DIGEST_AMD64: ${{ needs.build.outputs.digest_amd64 }}
+          DIGEST_ARM64: ${{ needs.build.outputs.digest_arm64 }}
         run: |
           set -euo pipefail
           CREDS=(); [ -n "${REG_USER:-}" ] && CREDS=(--creds "$REG_USER:$REG_PASS")
           LIST="build-multiarch-$GITHUB_RUN_ID"
           buildah manifest rm "$LIST" >/dev/null 2>&1 || true
           buildah manifest create "$LIST" >/dev/null
-          for ARCH in amd64 arm64; do
-            buildah manifest add "${CREDS[@]}" "$LIST" "docker://$REGISTRY/$IMAGE@$(cat "$RUNNER_TEMP/digests/digest-$ARCH")" >/dev/null
+          for DIGEST in "$DIGEST_AMD64" "$DIGEST_ARM64"; do
+            [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::build did not hand over a digest (got '$DIGEST')"; exit 1; }
+            buildah manifest add "${CREDS[@]}" "$LIST" "docker://$REGISTRY/$IMAGE@$DIGEST" >/dev/null
           done
           buildah manifest push "${CREDS[@]}" --all --digestfile /tmp/digest "$LIST" "docker://$REGISTRY/$IMAGE:$TAG"
           buildah manifest rm "$LIST" >/dev/null
