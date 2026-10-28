@@ -100,6 +100,10 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
           APP: ${{ inputs.app }}
+          GITOPS_REPO: ${{ inputs.gitops_repo }}
         run: |
+          # git@github.com:org/repo.git or ssh://git@ssh.github.com:443/org/repo.git -> org/repo
+          slug=$(printf '%s' "${GITOPS_REPO%.git}" | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#')
           echo "Copied $APP:$VERSION to prod registry." >> "$GITHUB_STEP_SUMMARY"
-          echo "Open & merge the gitops PR for branch promote/$APP-$VERSION, then Sync prod ArgoCD." >> "$GITHUB_STEP_SUMMARY"
+          echo "Open the gitops PR: https://github.com/$slug/compare/main...promote/$APP-$VERSION?expand=1" >> "$GITHUB_STEP_SUMMARY"
+          echo "After the merge, prod rolls out by itself if its Application auto-syncs; otherwise Sync it in ArgoCD." >> "$GITHUB_STEP_SUMMARY"
