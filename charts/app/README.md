@@ -14,9 +14,44 @@ dependencies:
 {{ include "app.all" . }}
 ```
 
-Named templates: `app.deployment`, `app.service`, `app.ingress`, `app.hpa`, `app.scaledobject`, `app.pdb`,
-`app.vmservicescrape`, `app.serviceaccount`, and `app.all` (all of them). An app that needs more (workers, migrations,
-CronJobs) adds its own templates beside it and can reuse `app.fullname`, `app.labels`, `app.selectorLabels`.
+## Example: PHP app (Symfony/Laravel)
+
+FrankenPHP web, a queue worker on KEDA, CronJobs and a migrations Job, all from one image
+(full file: `test/fixture/php-app.yaml`; nginx + php-fpm variant: `test/fixture/php-fpm.yaml`):
+
+```yaml
+image: { repository: harbor.example.com/app/shop, tag: "1.2.3" }
+replicas: 2
+envFrom: [{ secretRef: { name: shop } }]
+metrics: { port: 2019 }
+readinessProbe: { httpGet: { path: /healthz, port: http } }
+resources: { requests: { cpu: 100m, memory: 256Mi } }
+ingress: { enabled: true, hosts: [{ host: shop.example.com }] }
+workers:
+  messenger:
+    command: [php, bin/console]
+    args: [messenger:consume, async, --time-limit=3600]
+    resources: { requests: { cpu: 100m, memory: 256Mi } }
+    keda: { minReplicas: 1, maxReplicas: 6, triggers: [{ type: redis, metadata: { address: "shop-redis:6379", listName: messages, listLength: "50" } }] }
+cronjobs:
+  cleanup: { schedule: "0 3 * * *", command: [php, bin/console], args: [app:cleanup], resources: { requests: { cpu: 50m, memory: 128Mi } } }
+migrations:
+  enabled: true
+  command: [php, bin/console]
+  args: [doctrine:migrations:migrate, --no-interaction]
+  resources: { requests: { cpu: 100m, memory: 256Mi } }
+```
+
+Redis and the database are not part of this chart: point `env`/`envFrom` at them.
+
+## Example: Node app with nginx sidecar
+
+`test/fixture/alert-manager.yaml`: `containerName: node`, `ports: [{name: node, containerPort: 3000}]`, a `sidecars`
+nginx on `http` 8080, `service.port: 8080`, `ingress` on a sub-path, `metrics.port`.
+
+Named templates: `app.all` renders everything below; the parts are `app.deployment`, `app.service`, `app.ingress`,
+`app.hpa`, `app.scaledobject`, `app.pdb`, `app.vmservicescrape`, `app.serviceaccount`, `app.workers`, `app.cronjobs`,
+`app.migrations`. Extras can reuse `app.fullname`, `app.labels`, `app.podSpec`.
 
 Test: `charts/app/test/run.sh` (needs `helm` and `yq`; runs `kubeconform` when installed).
 
@@ -58,6 +93,23 @@ Test: `charts/app/test/run.sh` (needs `helm` and `yq`; runs `kubeconform` when i
 | `autoscaling.keda.enabled` / `minReplicas` / `maxReplicas` * / `triggers` * | off / 1 / / | Triggers verbatim. HPA and KEDA together fails |
 | `metrics.port` | | Enables the `metrics` container and Service port plus a VMServiceScrape |
 | `metrics.path` / `metrics.enabled` | `/metrics` / `true` | `enabled: false` turns the scrape off |
+
+### workers, cronjobs, migrations
+
+All three reuse the web image, `env`, `envFrom`, `volumes`, `podSecurityContext`, pull secrets and container hardening.
+`resources.requests` is required on each (rendering fails without it). None of them sets `ttlSecondsAfterFinished`.
+
+| Key | Meaning |
+|---|---|
+| `workers.<name>` | Deployment `<fullname>-worker-<name>`, no Service, Ingress or readinessProbe. `command`, `args`, `livenessProbe`, `terminationGracePeriodSeconds` (60), `replicas` (1) |
+| `workers.<name>.keda` / `.hpa` | `{minReplicas (1), maxReplicas *, triggers *}` / `{minReplicas, maxReplicas *, cpu (70)}`. Both on one worker fails. PDB when the minimum is 2 or more |
+| `cronjobs.<name>` | CronJob `<fullname>-cron-<name>`. `schedule` *, `command`, `args`, `concurrencyPolicy` (Forbid), `successfulJobsHistoryLimit` (3), `failedJobsHistoryLimit` (1), `startingDeadlineSeconds` (300), `backoffLimit` (0), `activeDeadlineSeconds`. Old Jobs are cleaned by the history limits |
+| `migrations` | `enabled` or `command` turns on Job `<fullname>-migrations`: ArgoCD `Sync` hook at sync-wave -1 (ServiceAccount at -2, Deployments at 0), `BeforeHookCreation`, `backoffLimit: 0`, `activeDeadlineSeconds` (600) |
+
+Migrations must be backwards compatible (expand/contract): the hook runs the new schema while the old pods still serve. Put the app's SopsSecret at sync-wave -2 or earlier so the Job finds its env on a first install.
+No TTL on the hook Job: a TTL-deleted hook Job would show up as out of sync; `BeforeHookCreation` removes the previous one.
+
+Pods carry `app.kubernetes.io/component` (`web`, `worker-<name>`, ...), so the web Service and PDB select web pods only.
 
 The PDB (`minAvailable: 1`) renders when the effective minimum replicas (replicas, HPA min or KEDA min) is 2 or more.
 

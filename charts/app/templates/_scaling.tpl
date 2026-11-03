@@ -55,6 +55,6 @@ metadata:
 spec:
   minAvailable: 1
   selector:
-    matchLabels: {{- include "app.selectorLabels" . | nindent 6 }}
+    matchLabels: {{- include "app.componentSelector" (dict "root" . "component" "web") | nindent 6 }}
 {{- end -}}
 {{- end -}}

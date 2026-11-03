@@ -1,0 +1,27 @@
+# nginx + php-fpm: php-fpm is the main container (9000), nginx the sidecar (8080).
+fullnameOverride: legacy
+containerName: php-fpm
+image:
+  repository: harbor.example.com/app/legacy-fpm
+  tag: "1.2.3"
+ports:
+  - { name: fpm, containerPort: 9000 }
+readinessProbe:
+  tcpSocket: { port: fpm }
+resources:
+  requests: { cpu: 100m, memory: 256Mi }
+sidecars:
+  - name: nginx
+    image: harbor.example.com/app/legacy-nginx:1.2.3
+    ports: [{ name: http, containerPort: 8080 }]
+    readinessProbe:
+      httpGet: { path: /healthz, port: http }
+    resources:
+      requests: { cpu: 25m, memory: 32Mi }
+service: { port: 8080 }
+workers:
+  queue:
+    command: [php, artisan]
+    args: [queue:work]
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }

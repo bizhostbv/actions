@@ -47,4 +47,7 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{ include "app.scaledobject" . }}
 {{ include "app.pdb" . }}
 {{ include "app.vmservicescrape" . }}
+{{ include "app.workers" . }}
+{{ include "app.cronjobs" . }}
+{{ include "app.migrations" . }}
 {{- end -}}

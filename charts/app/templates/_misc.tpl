@@ -24,5 +24,7 @@ kind: ServiceAccount
 metadata:
   name: {{ include "app.serviceAccountName" . }}
   labels: {{- include "app.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
 {{- end -}}
 {{- end -}}

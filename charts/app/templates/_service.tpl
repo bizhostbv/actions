@@ -7,7 +7,7 @@ metadata:
   labels: {{- include "app.labels" . | nindent 4 }}
 spec:
   type: ClusterIP
-  selector: {{- include "app.selectorLabels" . | nindent 4 }}
+  selector: {{- include "app.componentSelector" (dict "root" . "component" "web") | nindent 4 }}
   ports:
     - name: http
       port: {{ (.Values.service | default dict).port | default 80 }}
