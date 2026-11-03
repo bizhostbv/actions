@@ -290,6 +290,50 @@ Rules that apply to all groups:
   only grants that customer's groups.
 - Owners of the orgs and groups (Bizhost) sit outside this matrix.
 
+## 10. Proposed additions (not decided)
+
+These are proposals for the lead. Until he decides, §1–§9 apply unchanged.
+
+### 10.1 The production job checks that acc is healthy
+
+**Proposal.** Before it commits anything, the production job refuses unless acc is healthy for exactly the version it
+is about to release:
+- **ArgoCD:** the acc Application is `Synced` at `X.Y.Z` and `Healthy`, which means the rollout is complete and the pods
+  are Ready. This is read through the ArgoCD API with a read-only token.
+- **Ingress paths:** every Ingress path of the app returns 2xx to a plain GET from the runner.
+- **5xx:** there are no new 5xx since the acc sync, read with a read-only query on the metrics API.
+- **Changelog:** the job prints the PR titles between the current prod version and `X.Y.Z`, and the same titles go into
+  the commit body.
+
+**Decision needed.** §1 says "no CI job talks to a cluster". This proposal narrows that rule to: CI never *writes* to a
+cluster, and it may read status through the ArgoCD API and the metrics API with read-only tokens.
+- **Cost:** a read-only ArgoCD account per customer AppProject, a metrics read token, and the runner IPs on the acc
+  allow-list.
+
+### 10.2 Release notices and the watch after prod
+
+**Proposal.**
+- **Slack notice:** the pipeline posts every acc and prod release to Slack: app, version, actor, changelog and a link to
+  the run. There is one webhook secret per org or group.
+- **Watch after prod:** this is not a 30-minute CI job, which would hold a runner while it waits. Instead, the standard
+  alerts of §6 (5xx rate, not Ready, restarts) are labelled with the app, and during the first 30 minutes after a prod
+  release they also go to the release Slack channel.
+
+### 10.3 Trivy gate on the app image
+
+**Proposal.** After `build` and before `publish`, Trivy scans both per-arch images, by digest.
+- **Blocks:** CRITICAL findings that have a fix available, in OS packages and language dependencies.
+- **Reports only:** HIGH findings.
+- **Exceptions:** a `.trivyignore` file in the app repo. Every entry carries an expiry date and a reason.
+
+### 10.4 Staged rollout of edge binaries (Appendix A only)
+
+**Proposal.** Marking a version `stable` (Appendix A) goes in two steps:
+1. The production job marks it `canary`, and only the devices tagged canary install it.
+2. After a set period without errors from those devices, the same job, run with `rollout: all`, marks it `stable`.
+
+A rollback marks the former version as `stable` and `canary`.
+
 ## Appendix A. Edge binaries (optional)
 
 This appendix applies only to applications that ship binaries to devices, such as the Connect connector. Standard
