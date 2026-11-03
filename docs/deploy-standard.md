@@ -46,6 +46,9 @@ in is a merged PR.
 Each step runs only if the previous one succeeded. A version that is not in harbor never reaches gitops.
 
 Rules that apply to every step:
+- **Prod is always manual (hard rule).** Nothing reaches production without a member of `release-admins` running the
+  production job. That includes Renovate updates and security fixes. There is no exception path and no automerge to
+  prod. Lead, 3 Nov 2026: "de merge op productie blijft altijd handmatig ook voor renovate".
 - **Version format.** Computed from the conventional-commit PR title: `feat` gives a minor bump, `fix` a patch bump,
   `!` a major bump. PRs are squash-merged and a check enforces the title.
   - The git tag, the image tag and the chart version are all the same `X.Y.Z`, with no `v` prefix.
@@ -146,11 +149,12 @@ automatisch gemerged worden op main."
 
 - **Security fixes wait 1 day.** The trade-off: a known vulnerability stays open on the cluster for up to a day longer.
   In exchange, a hijacked "security" release, a common attack pattern, does not reach the cluster on its release day.
-  For a vulnerability that is being actively exploited, a person can merge the Renovate PR before the day is over.
+  For a vulnerability that is being actively exploited, a person can merge the Renovate PR to `main` before the day is
+  over. Prod still goes through the manual production job.
 - **PR titles.** Renovate uses conventional titles (`semanticCommits`): `fix(deps): …` and `chore(deps): …` release as
   a patch.
-- **Automerge.** A Renovate PR that is green merges by itself, and that merge releases to acc like any other. Prod
-  stays the manual production job.
+- **Automerge stops at acc.** A Renovate PR that is green merges by itself, and that merge releases to acc like any
+  other. Prod is always the manual production job (§1), also for Renovate and security fixes.
 - **Limit.** The cooldown covers the dependency Renovate bumps and its lockfile changes. It does not check the age of
   every transitive package that a fresh lockfile resolves. Lockfile maintenance therefore stays manual (no automerge),
   and the app's CI runs `npm audit` / `composer audit` plus the image scan.
