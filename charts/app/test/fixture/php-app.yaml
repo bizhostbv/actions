@@ -1,0 +1,54 @@
+# Standard PHP app: FrankenPHP web, messenger worker on KEDA, cronjobs, migrations, ingress.
+fullnameOverride: shop
+image:
+  repository: harbor.example.com/app/shop
+  tag: "1.2.3"
+replicas: 2
+ports:
+  - { name: http, containerPort: 8080 }
+metrics: { port: 2019 }
+envFrom:
+  - secretRef: { name: shop }
+env:
+  - { name: REDIS_URL, value: "redis://shop-redis:6379" }
+readinessProbe:
+  httpGet: { path: /healthz, port: http }
+resources:
+  requests: { cpu: 100m, memory: 256Mi }
+service: { port: 8080 }
+ingress:
+  enabled: true
+  hosts:
+    - host: shop.example.com
+workers:
+  messenger:
+    command: [php, bin/console]
+    args: [messenger:consume, async, --time-limit=3600, --memory-limit=200M]
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+    keda:
+      minReplicas: 2
+      maxReplicas: 6
+      triggers:
+        - type: redis
+          metadata: { address: "shop-redis:6379", listName: messages, listLength: "50" }
+cronjobs:
+  cleanup:
+    schedule: "0 3 * * *"
+    command: [php, bin/console]
+    args: [app:cleanup]
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+  report:
+    schedule: "*/15 * * * *"
+    command: [php, bin/console]
+    args: [app:report]
+    activeDeadlineSeconds: 600
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+migrations:
+  enabled: true
+  command: [php, bin/console]
+  args: [doctrine:migrations:migrate, --no-interaction]
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
