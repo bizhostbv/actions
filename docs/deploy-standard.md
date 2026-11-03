@@ -108,7 +108,8 @@ gwsn/<app>/environments/<env>/manifests/            # SopsSecret and other plain
   - retry 5×, starting at 30 s.
   - The manual production job is the gate; nobody clicks Sync.
 - **Jobs.**
-  - Migrations run as an ArgoCD `Sync` hook with `BeforeHookCreation`.
+  - Migrations run as an ArgoCD `Sync` hook at sync-wave -1 with `BeforeHookCreation`; the app's SopsSecret sits at
+    sync-wave -2 or earlier.
   - No `ttlSecondsAfterFinished` on anything ArgoCD owns (selfHeal would recreate it).
   - CronJobs keep their history through history limits.
 - **Secrets.** SopsSecret, never inside a chart. ESO/Azure Key Vault only for what Bizhost manages (database
@@ -151,8 +152,9 @@ automatisch gemerged worden op main."
   In exchange, a hijacked "security" release, a common attack pattern, does not reach the cluster on its release day.
   For a vulnerability that is being actively exploited, a person can merge the Renovate PR to `main` before the day is
   over. Prod still goes through the manual production job.
-- **PR titles.** Renovate uses conventional titles (`semanticCommits`): `fix(deps): …` and `chore(deps): …` release as
-  a patch.
+- **PR titles.** Renovate uses conventional titles (`semanticCommits`). Runtime dependencies and images get
+  `fix(deps): …`, which releases as a patch and reaches acc. Dev dependencies and CI actions get `chore(deps): …`, which
+  releases nothing, because they do not change what runs.
 - **Automerge stops at acc.** A Renovate PR that is green merges by itself, and that merge releases to acc like any
   other. Prod is always the manual production job (§1), also for Renovate and security fixes.
 - **Limit.** The cooldown covers the dependency Renovate bumps and its lockfile changes. It does not check the age of
@@ -176,7 +178,8 @@ The library chart renders the standard resources:
 For the typical PHP application, the same chart also renders, from the same image:
 - **workers:** one Deployment per worker, KEDA on queue depth;
 - **cronjobs:** one CronJob each, with `concurrencyPolicy: Forbid` and history limits;
-- **migrations:** a Job run as an ArgoCD `PreSync` hook with `BeforeHookCreation`, `backoffLimit: 0` and no TTL.
+- **migrations:** a Job run as an ArgoCD `Sync` hook at sync-wave -1, after the ServiceAccount and secrets and before
+  the Deployments, with `BeforeHookCreation`, `backoffLimit: 0` and no TTL.
 
 Apps only add templates for what really is their own.
 
