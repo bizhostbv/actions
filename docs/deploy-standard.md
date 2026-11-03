@@ -1,0 +1,220 @@
+# Deploy standard for the gwsn cluster
+
+Status: approved by the lead on 3 Nov 2026. The shared pipeline (§8) is being built. Until it ships, the existing
+workflows and [`DEPLOYMENTS.md`](DEPLOYMENTS.md) keep working; this document then replaces `DEPLOYMENTS.md`.
+This repo is public, so this document names no IP addresses, secrets or customer internals.
+
+**Scope.** This is the baseline for every application on the `gwsn-production` cluster: GCG (Connect, shop, Product
+Manager, website, cdn), Bizhost-internal apps, and customer projects as
+they move there. Lead, 3 Nov 2026:
+- "dit geld dus voor voor alle projecten die op gwsn cluster draaien dat dit de basis wordt";
+- "de deployflow wil ik voor alle applicaties zo goed als hetzelfde hebben".
+
+Not in scope: CI for repos that ship no service on the cluster (libraries, the design system).
+
+## 1. Flow
+
+Lead, 3 Nov 2026:
+- "dus we gaan alleen main gebruiken, main wordt altijd beschermd als dat kan en mag je alleen naar toe merge vanuit een
+  merge request. na de merge komt er een pipeline die automatisch een versie tagged en deze uitrolt naar acceptatie
+  omgeving (push naar gitops) en een manual handeling die klaarstaat om de productie te release (dat is dus ook een
+  commit in gitops op de productie)".
+- "versie taggen is dus image bouwen en taggen en pushen naar harbor en daarna naar gitops een commit".
+
+**Branches.** `main` only, plus short-lived PR branches. `main` is protected wherever the platform allows. The only way
+in is a merged PR.
+
+**The pipeline after a merge to `main`, in this order:**
+1. Compute `X.Y.Z` and create the git tag.
+2. Build the image and tag it `X.Y.Z`; package the chart as `X.Y.Z`.
+3. Push the image and chart to harbor.
+4. Commit the acc bump (`X.Y.Z`) to the gitops repo. ArgoCD syncs acc.
+5. Manual job "Release to production" (guards in 1.1): commits the same `X.Y.Z` to gitops prod. ArgoCD syncs prod.
+
+Each step runs only if the previous one succeeded. A version that is not in harbor never reaches gitops.
+
+Rules that apply to every step:
+- **Version format.** Computed from the conventional-commit PR title: `feat` gives a minor bump, `fix` a patch bump,
+  `!` a major bump. PRs are squash-merged and a check enforces the title.
+  - The git tag, the image tag and the chart version are all the same `X.Y.Z`, with no `v` prefix.
+  - Never a pipeline ID, never `latest`, never a branch name.
+- **Build once.** acc and prod run the same image. Prod only gets a version acc already ran.
+- **No cluster access from CI.** CI writes to harbor and to gitops. It never talks to a cluster: no helm or kubectl
+  deploy jobs.
+- **Migrations are backwards compatible** (expand/contract), so the previous release still runs on the new schema.
+  Without that, a rollback is not safe.
+- **Changelog.** The release notes are generated from the commits.
+- **Implementation.** One shared implementation, with a thin wrapper for GitHub and one for GitLab (§8).
+
+### 1.1 The production job
+
+| Guard | How |
+|---|---|
+| Who | Only members of the group `release-admins` (§9). The job checks the person who started it, as its first step, against that group in the GitHub org or GitLab group. The job only runs on `main`. |
+| Same tag as acc | The version is not typed in. The job reads it from the gitops `acceptance.yaml` and checks that the image exists in harbor. |
+| No going backwards | The job refuses a version equal to or older than the one in `production.yaml`. |
+| Rollback | The same job with `rollback: X.Y.Z`. It only accepts a version that `production.yaml` held before, according to the git history. |
+| Concurrency | One concurrency group per app. The gitops push rebases and retries. |
+| Audit | Commit message `release(<app>): X.Y.Z to production by <actor>`, plus a link to the run. The git history of `production.yaml` is the release log. |
+
+### 1.2 Edge binaries (for example the Connect connector)
+
+- **Same pipeline.** Steps 1–3 run as for any service, but the artifact is signed binaries, pushed to harbor as an OCI
+  artifact (oras).
+- **Step 4** commits the version to acc.
+- **Step 5** marks `X.Y.Z` as `stable` in the application's release source. Devices only install `stable`.
+
+## 2. Tenancy: what every customer or product gets
+
+Every customer gets the same set of resources. A product inside a customer only gets its own set when its access has to
+differ.
+
+| Thing | Name | Example (GCG) |
+|---|---|---|
+| Harbor project (images, `charts/`, edge artifacts) | `<customer>` | `gcg` (Connect included) |
+| Harbor robots | `<customer>-push` (CI), `<customer>-pull` (cluster) | `gcg-push`, `gcg-pull` |
+| Namespaces | `<customer>[-<product>]-<env>`, env `acc` or `prod` | `gcg-acc`, `gcg-connect-prod` |
+| Pull secret in every namespace | SopsSecret `harbor-pull` (from `<customer>-pull`) | |
+| Gitops repo | one per customer, `<customer>-gitops`, in the customer's GitHub org or GitLab group | `gcg-gitops-repo` (existing name stays) |
+| ArgoCD AppProject | `<customer>`: sources = its gitops repo + `registry.k8s-bizhost.nl/<customer>`; destinations = `<customer>-*` namespaces on gwsn | `gcg` |
+| Parent Application | one per customer in `support-kubernetes-infra`, globbing `gwsn/*/argocd/*.yaml` in that customer's gitops repo | one MR when a customer is onboarded, never per app |
+| CI → gitops write | GitHub: the org's `deployflow` GitHub App (contents write on the gitops repo, members read for the group check). GitLab: a project access token on the gitops project. | |
+| Access groups | `release-admins`, `devops`, `developers` (§9) in the customer's GitHub org or GitLab group | |
+
+Onboarding a customer is one change, by Bizhost: one MR in `support-kubernetes-infra` that creates the harbor project,
+the robots, the AppProject and the parent Application. After that, adding an app needs no infra change.
+
+## 3. Gitops layout (every customer gitops repo)
+
+```
+gwsn/<app>/argocd/{acceptance,production}.yaml      # Application, chart from harbor OCI, targetRevision X.Y.Z
+gwsn/<app>/environments/<env>/values.yaml
+gwsn/<app>/environments/<env>/manifests/            # SopsSecret and other plain manifests
+```
+
+- **Chart.** Comes from `registry.k8s-bizhost.nl/<customer>/charts/<app>:X.Y.Z`. Never vendored in gitops.
+- **Application block.** Identical everywhere:
+  - automated `prune` + `selfHeal` on acc and prod;
+  - `syncOptions: [CreateNamespace=true, PruneLast=true, ServerSideApply=true]`;
+  - retry 5×, starting at 30 s.
+  - The manual production job is the gate; nobody clicks Sync.
+- **Jobs.**
+  - Migrations run as an ArgoCD `Sync` hook with `BeforeHookCreation`.
+  - No `ttlSecondsAfterFinished` on anything ArgoCD owns (selfHeal would recreate it).
+  - CronJobs keep their history through history limits.
+- **Secrets.** SopsSecret, never inside a chart. ESO/Azure Key Vault only for what Bizhost manages (database
+  credentials).
+
+## 4. Images
+
+- **One base-image source for the whole cluster.** The `base-images` repo (today
+  `globalcontrolgroup/base-images`) moves to `bizhostbv/base-images` and pushes to harbor project `base`:
+  - `php-base` (FrankenPHP)
+  - `node-base`
+  - `nginx-base` (new)
+
+  All are Debian slim, built for amd64 and arm64, rebuilt weekly behind a Trivy gate. `bizhost/devops/base-images`
+  (GitLab) is retired.
+- **Pinning.** Services pin `tag@sha256:digest`. Renovate (shared preset) bumps the pin; every repo opts in.
+- **User.** Runtime images run as uid 1000.
+- **Tags.** `X.Y.Z` is immutable in harbor. Non-release artifacts are deleted after 30 days.
+
+## 5. Chart
+
+**Shared library chart: `app`.** It lives in `bizhostbv/actions/charts/app` (successor of `chart-template`) and is
+published to harbor `base/charts/app`. Every app chart lives in its app repo and depends on it.
+
+The library chart renders the standard resources:
+- Deployment
+- Service
+- Ingress
+- HPA or KEDA ScaledObject
+- PDB
+- VMServiceScrape
+- ServiceAccount
+
+Apps only add what is their own: workers, migrations, CronJobs.
+
+Defaults that make the platform rules the easy path:
+- **Rollout.** `RollingUpdate`, `maxUnavailable: 0`, `maxSurge: 1`.
+- **Probes.** A `readinessProbe` is required; the chart does not render without one.
+- **Resources.** `resources.requests` is required. The memory limit equals the memory request; there is no CPU limit.
+- **Security.** `runAsNonRoot: true`; a read-only root filesystem where possible.
+- **Ingress.**
+  - Class `haproxy`, issuer `lets-encrypt-cloudflare`.
+  - On acc, an IP allow-list from one shared list.
+  - `ingress.monitoring: false` renders `blackbox-exporter/ignore: "true"`. It is only for a first rollout.
+- **Availability.** Prod runs at least 2 replicas, with a PDB of `minAvailable: 1`.
+- **Scaling.** Web workloads scale with HPA on CPU (70 %); workers scale with KEDA on queue depth. Never both on one
+  Deployment.
+
+## 6. Endpoints and monitoring
+
+- **Endpoints.**
+  - `/healthz`: liveness, with no dependencies.
+  - `/readyz`: readiness, covering the service's own dependencies.
+  - `/metrics`: Prometheus format, on its own port, never routed through the Ingress.
+- **No P1 from a release (platform monitoring).** Every Ingress host and path is probed every minute. A failed probe
+  pages on-call as a P1.
+  - Every Ingress path returns 2xx on its root without authentication.
+  - After every acc sync, a check requests each Ingress path.
+  - A new Ingress either has a Ready pod in the same PR, or ships with `ingress.monitoring: false`, removed once the path
+    returns 2xx.
+- **Scraping.** VMServiceScrape is on by default.
+- **Standard alerts (VMRule).** Restarts; not Ready for more than 5 minutes; 5xx rate; queue depth. There is one
+  dashboard per runtime.
+
+## 7. Source hosting
+
+- **GitHub** (`bizhostbv`, `globalcontrolgroup`, or the customer's own org) and **GitLab** (`bizhost`, `gwsn`) are both
+  supported with the same pipeline (§8). GCG moves to GitHub (lead, 3 Nov 2026); other projects choose.
+- **Protecting `main`.** A GitHub org with private application repos needs GitHub Team, because Free cannot protect
+  branches on private repos. GitLab Free can protect branches.
+
+## 8. Shared pipeline: one implementation, two wrappers
+
+Lead, 3 Nov 2026: "dan kunnen we dus ook een shared pipeline actions voor github en in gitlab, houd er rekening mee dat
+het niet meer alleen gcg is maar ook gwsn en bizhost".
+
+| Part | Where | What |
+|---|---|---|
+| Implementation | `bizhostbv/actions/deployflow/` | Shell scripts for each step: `version`, `build`, `push`, `gitops-acc`, `release-prod`. They take every project value as input. Nothing customer-specific is built in. |
+| Tool image | `registry.k8s-bizhost.nl/base/deployflow:X.Y.Z` | The scripts plus buildah, skopeo, helm, oras, yq and git. Built from the same repo with this same pipeline. |
+| GitHub wrapper | `bizhostbv/actions/.github/workflows/deploy.yml` | A reusable workflow. Each job calls a script. |
+| GitLab wrapper | `gitlab.com/bizhost/devops/deployflow` (public) | A CI/CD component (`templates/deploy.yml`). Each job runs in the tool image and calls the same script. |
+
+Both wrappers are versioned with the same `X.Y.Z` as the scripts, and a repo pins one version. The values each project
+passes:
+- harbor project;
+- app name;
+- Dockerfile, build context and chart directory;
+- gitops repo and the paths of its acc and prod Application files;
+- the GitHub org or GitLab group that holds the access groups.
+
+Builds run on native amd64 and arm64 runners, labelled `harbor-builder` and `harbor-builder-arm64` on both platforms.
+
+## 9. Access groups
+
+Three groups, with the same names everywhere: `release-admins`, `devops`, `developers`. Lead, 3 Nov 2026: "heel simpel
+we hebben 3 groepen, release-admins, devops en developers".
+
+| | developers | devops | release-admins |
+|---|---|---|---|
+| App repo | Open a PR/MR and review. Merge to `main` after one approval and green checks. | As developers. Also owns CI, chart and Dockerfile (CODEOWNERS approval on those paths). | As developers. |
+| Production job | No | No | Yes, the only group allowed. That includes rollback. |
+| Gitops repo | Open a PR. | Approve and merge gitops PRs (CODEOWNERS). | Approve and merge gitops PRs. |
+| Harbor | Read: pull, view scans. | Read, plus manage retention and scans for the project. | Read. |
+| ArgoCD | Read: status, diff, logs. | Read, plus refresh. | Read. |
+
+Rules that apply to all groups:
+- **Gitops writes.** Only CI commits directly to gitops `main` (acc and prod bumps). Humans change gitops only through a
+  PR/MR.
+- **Nobody syncs, rolls back or deletes in the ArgoCD UI.** A rollback is the production job.
+
+**Per-customer scoping, with no new group names.**
+- On GitHub, each org has its own three teams.
+- On GitLab, each top-level group (`bizhost`, `gwsn`) has the three groups as subgroups. A project or customer subgroup
+  is shared with them at the matching role.
+- Harbor and ArgoCD map the same groups through SSO group claims (`<org>:<group>`). The ArgoCD AppProject of a customer
+  only grants that customer's groups.
+- Owners of the orgs and groups (Bizhost) sit outside this matrix.

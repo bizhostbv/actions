@@ -1,5 +1,7 @@
 # bizhostbv/actions
 
+**The deploy standard for every application on the gwsn cluster: [`docs/deploy-standard.md`](docs/deploy-standard.md).**
+
 Reusable GitHub Actions workflows shared across the org. Public so any repo (any org/account) can call them.
 
 ## k8s-release — immutable container build+push pipeline

@@ -1,3 +1,6 @@
+> The deploy standard for the gwsn cluster is [`deploy-standard.md`](deploy-standard.md). This guide describes the
+> current workflows and is replaced by it once the shared pipeline ships.
+
 # Deploying your app on Kubernetes — Developer Guide
 
 This is the standard way to ship any container app to our Kubernetes cluster. Follow it once
