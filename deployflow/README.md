@@ -60,5 +60,11 @@ Tool image: `deployflow/Dockerfile`, published as `base/deployflow:<tag>`.
 - Self-hosted runners labelled `harbor-builder` (amd64) and `harbor-builder-arm64`, with registry login stored, or `DEPLOYFLOW_REGISTRY_*` on GitLab.
 - `main` protected, squash merge, PR/MR title check required.
 
+## Releasing
+Tags follow this repo's scheme: annotated `vX.Y.Z` plus the moving major tag `vX`. The reusable workflows check out
+the script at `DEPLOYFLOW_REF`, so the release PR sets `DEPLOYFLOW_REF` to the new tag in `deploy.yml`,
+`release-production.yml` and `pr-title.yml` (the tests fail if they differ or name a branch); tag the merge commit
+after the merge.
+
 ## Tests
 `bash deployflow/test/run.sh` (needs git, yq v4, jq; stubs replace skopeo, buildah, helm, curl).

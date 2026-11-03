@@ -303,5 +303,10 @@ assert "release-prod: rollback with missing artifacts refused" has "$OUT" "does 
 setup_rp 1.3.0 1.0.0 1.1.0 1.2.0; art 1.1.0; rp ROLLBACK=1.1.0 STUB_X=1 DEPLOYFLOW_PROVIDER=github ACTOR='eve bad'
 assert "release-prod: odd ACTOR refused" test "$RC" -eq 1
 
+# The reusable workflows fetch the script at DEPLOYFLOW_REF: one release tag in all three, never a branch.
+WF="$(dirname "$0")/../../.github/workflows"
+REFS=$(grep -h '^  DEPLOYFLOW_REF:' "$WF/deploy.yml" "$WF/release-production.yml" "$WF/pr-title.yml" | awk '{print $2}' | sort -u)
+assert "workflows: one DEPLOYFLOW_REF, a vX.Y.Z tag" test "$(echo "$REFS" | grep -cE '^v[0-9]+\.[0-9]+\.[0-9]+$')" = 1 -a "$(echo "$REFS" | wc -l | tr -d ' ')" = 1
+
 echo; echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]
