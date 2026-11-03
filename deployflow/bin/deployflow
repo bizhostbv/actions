@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+# deployflow: one implementation of the shared deploy pipeline. GitHub workflows and the GitLab
+# template are thin wrappers that set the env vars below and call one subcommand.
+#
+# Subcommands: version | push-tag | check-title | guard-immutable | build | publish | gitops-acc | release-prod
+#
+# Env vars (each subcommand fails with a clear message when one it needs is missing):
+#   DEPLOYFLOW_OUTPUT   file that receives key=value lines (GitHub: $GITHUB_OUTPUT, GitLab: a dotenv file)
+#   DEPLOYFLOW_PROVIDER github | gitlab                       (release-prod)
+#   PROJECT, APP        registry project and app/chart name   [a-z0-9-], no leading/trailing dash
+#   REGISTRY            registry host, e.g. registry.example.org
+#   VERSION             X.Y.Z (no v prefix)                   (push-tag, guard-immutable, build, publish, gitops-acc)
+#   ARCH                amd64 | arm64                         (build)
+#   DOCKERFILE, CONTEXT build inputs, default Dockerfile and .   (build)
+#   GIT_SHA             commit being built                    (build)
+#   NPM_TOKEN           optional, mounted as build secret id=npm_token (build)
+#   DIGEST_AMD64, DIGEST_ARM64  sha256:... from the two builds (publish)
+#   CHART_DIR           chart directory, chart name must equal APP (publish)
+#   REGISTRY_USER, REGISTRY_PASSWORD  optional registry login (when no login is pre-stored on the host)
+#   TITLE               PR/MR title                           (check-title)
+#   GITOPS_REPO         clone URL of the gitops repo; git auth is set up by the wrapper (gitops-acc, release-prod)
+#   GITOPS_ACC_FILE, GITOPS_PROD_FILE  Application files in the gitops repo (spec.sources[0].targetRevision)
+#   RUN_URL             link to the pipeline run, put in the commit body
+#   GIT_USER_NAME, GIT_USER_EMAIL  committer identity for gitops commits and tags, default deployflow
+#   release-prod: ORG (GitHub org or GitLab group path), ACTOR (login), ACTOR_ID (GitLab user id),
+#     API_TOKEN (reads group membership), GITHUB_API_URL (default https://api.github.com),
+#     GITLAB_API_URL (e.g. $CI_API_V4_URL), ROLLBACK (empty = release acc version; X.Y.Z = roll back to it)
+set -euo pipefail
+
+NAME_RE='^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
+VER_RE='^[0-9]+\.[0-9]+\.[0-9]+$'
+TITLE_RE='^(feat|fix|chore|docs|refactor|perf|test|build|ci|style|revert)(\([^)]+\))?!?: .+'
+ACTOR_RE='^[A-Za-z0-9_.-]+(\[bot\])?$'
+ADMIN_GROUP=release-admins
+
+die() { echo "deployflow: error: $*" >&2; exit 1; }
+need() { local v; for v in "$@"; do [ -n "${!v:-}" ] || die "$v is required"; done; }
+valid() { need "$1"; [[ ${!1} =~ $2 ]] || die "$1 must match $2 (got '${!1}')"; }
+out() { if [ -n "${DEPLOYFLOW_OUTPUT:-}" ]; then printf '%s\n' "$1" >> "$DEPLOYFLOW_OUTPUT"; fi; }
+is_semver() { [[ ${1:-} =~ $VER_RE ]]; }
+# ver_gt A B: A is strictly newer than B
+ver_gt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]; }
+rev_get() { yq e '.spec.sources[0].targetRevision // ""' "$1"; }
+rev_set() { V=$2 yq e -i '.spec.sources[0].targetRevision = strenv(V)' "$1"; }
+
+umask 077
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+registry_login() {
+  [ -n "${REGISTRY_USER:-}" ] && [ -n "${REGISTRY_PASSWORD:-}" ] || return 0
+  printf '%s' "$REGISTRY_PASSWORD" | skopeo login -u "$REGISTRY_USER" --password-stdin "$REGISTRY" >/dev/null
+  printf '%s' "$REGISTRY_PASSWORD" | helm registry login "$REGISTRY" -u "$REGISTRY_USER" --password-stdin >/dev/null
+}
+
+# --- gitops helpers: GW is the working clone ---------------------------------------------
+gitops_clone() {
+  need GITOPS_REPO
+  GW="$TMP/gitops"
+  git clone -q "$GITOPS_REPO" "$GW" || die "cannot clone the gitops repo"
+  git -C "$GW" config user.name "${GIT_USER_NAME:-deployflow}"
+  git -C "$GW" config user.email "${GIT_USER_EMAIL:-deployflow@localhost}"
+}
+gitops_file() { [ -f "$GW/$1" ] || die "$1 does not exist in the gitops repo"; }
+gitops_commit_push() { # $1 = subject, $2 = file
+  git -C "$GW" add "$2"
+  git -C "$GW" commit -q -m "$1" -m "${RUN_URL:-no run url}"
+  local i
+  for i in 1 2 3; do
+    git -C "$GW" push -q origin HEAD && return 0
+    echo "push rejected (attempt $i/3), rebasing" >&2
+    git -C "$GW" pull -q --rebase || { git -C "$GW" rebase --abort 2>/dev/null || true; die "rebase onto the gitops repo failed"; }
+  done
+  die "push to the gitops repo failed after 3 attempts"
+}
+
+# --- subcommands -------------------------------------------------------------------------
+cmd_version() {
+  git fetch --tags --force >/dev/null 2>&1 || true
+  # existing tags may or may not carry a v; compare on the bare number. New tags never get a v.
+  local base tag range subjects bodies bump maj min pat new
+  base=$(git tag --list --merged HEAD | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | sort -V | tail -n1 || true)
+  if [ -z "$base" ]; then base=0.0.0; range=HEAD
+  else
+    tag=$base; git rev-parse -q --verify "refs/tags/$tag" >/dev/null || tag="v$base"
+    range="$tag..HEAD"
+  fi
+  subjects=$(git log "$range" --no-merges --format='%s' || true)
+  bodies=$(git log "$range" --no-merges --format='%b' || true)
+  bump=none
+  if grep -qE '^[a-zA-Z]+(\([^)]*\))?!:' <<<"$subjects" || grep -qE 'BREAKING[ -]CHANGE' <<<"$bodies"; then bump=major
+  elif grep -qE '^feat(\([^)]*\))?:' <<<"$subjects"; then bump=minor
+  elif grep -qE '^fix(\([^)]*\))?:' <<<"$subjects"; then bump='patch'
+  fi
+  if [ "$bump" = none ]; then
+    echo none; out "released=false"; return 0
+  fi
+  maj=${base%%.*}; min=${base#*.}; min=${min%%.*}; pat=${base##*.}
+  if [ "$bump" = major ] && [ "$maj" -eq 0 ]; then bump=minor; fi   # 0.x: breaking bumps minor, no premature 1.0
+  case $bump in
+    major) maj=$((maj+1)); min=0; pat=0;;
+    minor) min=$((min+1)); pat=0;;
+    patch) pat=$((pat+1));;
+  esac
+  new="$maj.$min.$pat"
+  git -c user.name="${GIT_USER_NAME:-deployflow}" -c user.email="${GIT_USER_EMAIL:-deployflow@localhost}" \
+    tag -a "$new" -m "release $new"
+  echo "$new"; out "version=$new"; out "released=true"
+}
+
+# Pushes tag $VERSION (creates it on HEAD when `version` ran in another job).
+cmd_push_tag() {
+  valid VERSION "$VER_RE"
+  git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null || git \
+    -c user.name="${GIT_USER_NAME:-deployflow}" -c user.email="${GIT_USER_EMAIL:-deployflow@localhost}" \
+    tag -a "$VERSION" -m "release $VERSION"
+  git push -q origin "refs/tags/$VERSION"
+}
+
+cmd_check_title() {
+  [[ ${TITLE:-} =~ $TITLE_RE ]] || die "title '${TITLE:-}' is not a conventional commit. Use type(scope)!: subject, with type one of feat|fix|chore|docs|refactor|perf|test|build|ci|style|revert"
+  echo "title ok"
+}
+
+cmd_guard_immutable() {
+  valid PROJECT "$NAME_RE"; valid APP "$NAME_RE"; valid VERSION "$VER_RE"; need REGISTRY
+  registry_login
+  if skopeo inspect "docker://$REGISTRY/$PROJECT/$APP:$VERSION" >/dev/null 2>&1; then
+    die "image $REGISTRY/$PROJECT/$APP:$VERSION already exists; versions are immutable"
+  fi
+  if skopeo inspect --raw "docker://$REGISTRY/$PROJECT/charts/$APP:$VERSION" >/dev/null 2>&1; then
+    die "chart $REGISTRY/$PROJECT/charts/$APP:$VERSION already exists; versions are immutable"
+  fi
+  echo "$APP:$VERSION is free"
+}
+
+cmd_build() {
+  valid PROJECT "$NAME_RE"; valid APP "$NAME_RE"; valid VERSION "$VER_RE"; need REGISTRY ARCH GIT_SHA
+  case $ARCH in amd64|arm64) ;; *) die "ARCH must be amd64 or arm64 (got '$ARCH')";; esac
+  registry_login
+  local img="localhost/build:$ARCH" secret_args=() got oci digest
+  if [ -n "${NPM_TOKEN:-}" ]; then
+    printf '%s' "$NPM_TOKEN" > "$TMP/npm_token"
+    secret_args=(--secret "id=npm_token,src=$TMP/npm_token")
+  fi
+  buildah bud --layers --isolation chroot --ulimit nofile=65536:65536 ${secret_args[@]+"${secret_args[@]}"} \
+    --build-arg "APP_BUILD_SHA=$GIT_SHA" \
+    --build-arg "APP_BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --build-arg "APP_BUILD_VERSION=$VERSION" \
+    -f "${DOCKERFILE:-Dockerfile}" -t "$img" "${CONTEXT:-.}"
+  got=$(buildah inspect --format '{{.OCIv1.Architecture}}' "$img")
+  [ "$got" = "$ARCH" ] || die "built $got on the $ARCH runner"
+  # push by digest, untagged: via an OCI layout, whose manifest digest skopeo keeps
+  oci="$TMP/oci"
+  buildah push --digestfile "$TMP/digest" "$img" "oci:$oci:$ARCH"
+  digest=$(cat "$TMP/digest")
+  [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || die "buildah gave no digest (got '$digest')"
+  skopeo copy --preserve-digests "oci:$oci:$ARCH" "docker://$REGISTRY/$PROJECT/$APP@$digest"
+  out "digest_$ARCH=$digest"
+  echo "digest_$ARCH=$digest"
+}
+
+cmd_publish() {
+  valid PROJECT "$NAME_RE"; valid APP "$NAME_RE"; valid VERSION "$VER_RE"; need REGISTRY CHART_DIR DIGEST_AMD64 DIGEST_ARM64
+  registry_login
+  local img="$REGISTRY/$PROJECT/$APP:$VERSION" list="deployflow-$APP-$VERSION" d platforms chart="$TMP/chart"
+  buildah manifest rm "$list" >/dev/null 2>&1 || true
+  buildah manifest create "$list" >/dev/null
+  for d in "$DIGEST_AMD64" "$DIGEST_ARM64"; do
+    [[ $d =~ ^sha256:[0-9a-f]{64}$ ]] || die "not a digest: '$d'"
+    buildah manifest add "$list" "docker://$REGISTRY/$PROJECT/$APP@$d" >/dev/null
+  done
+  buildah manifest push --all "$list" "docker://$img"
+  buildah manifest rm "$list" >/dev/null
+  platforms=$(skopeo inspect --raw "docker://$img" | jq -r '[.manifests[].platform.architecture] | sort | join(",")')
+  [ "$platforms" = "amd64,arm64" ] || die "$img has '$platforms', expected amd64,arm64"
+  # bake the image tag into a temp copy of the chart: chart version == running image
+  cp -R "$CHART_DIR" "$chart"
+  [ "$(yq e '.name' "$chart/Chart.yaml")" = "$APP" ] || die "chart name in $CHART_DIR/Chart.yaml must equal $APP"
+  V=$VERSION yq e -i '.image.tag = strenv(V)' "$chart/values.yaml"
+  mkdir "$TMP/pkg"
+  helm package "$chart" --version "$VERSION" --app-version "$VERSION" -d "$TMP/pkg"
+  helm push "$TMP/pkg/$APP-$VERSION.tgz" "oci://$REGISTRY/$PROJECT/charts"
+  echo "published $img and chart $VERSION"
+}
+
+cmd_gitops_acc() {
+  valid APP "$NAME_RE"; valid VERSION "$VER_RE"; need GITOPS_ACC_FILE
+  gitops_clone; gitops_file "$GITOPS_ACC_FILE"
+  local f="$GW/$GITOPS_ACC_FILE" cur
+  cur=$(rev_get "$f")
+  if is_semver "$cur" && ! ver_gt "$VERSION" "$cur"; then
+    echo "skip: acceptance already runs $cur, which is not older than $VERSION; never going backwards"; return 0
+  fi
+  rev_set "$f" "$VERSION"
+  gitops_commit_push "release($APP): $VERSION to acceptance" "$GITOPS_ACC_FILE"
+  echo "acceptance now at $VERSION"
+}
+
+member_ok() {
+  local url hl hdr="$TMP/hdr" body="$TMP/body" code
+  # shellcheck disable=SC2153
+  case ${DEPLOYFLOW_PROVIDER:-} in
+    github)
+      url="${GITHUB_API_URL:-https://api.github.com}/orgs/$ORG/teams/$ADMIN_GROUP/memberships/$ACTOR"
+      hl="Authorization: Bearer ${API_TOKEN}";;
+    gitlab)
+      need ACTOR_ID GITLAB_API_URL
+      url="$GITLAB_API_URL/groups/${ORG//\//%2F}%2F$ADMIN_GROUP/members/$ACTOR_ID"   # direct members only: no inherited parent-group owners
+      hl="PRIVATE-TOKEN: $API_TOKEN";;
+    *) die "DEPLOYFLOW_PROVIDER must be github or gitlab";;
+  esac
+  printf '%s\n' "$hl" > "$hdr"   # header file, so the token is not on a command line
+  code=$(curl -sS -o "$body" -w '%{http_code}' -H "@$hdr" "$url" 2>/dev/null) || code=000
+  [ "$code" = 200 ] || return 1
+  if [ "$DEPLOYFLOW_PROVIDER" = github ]; then [ "$(jq -r '.state // empty' "$body")" = active ]
+  else jq -e '.access_level != null' "$body" >/dev/null; fi
+}
+
+cmd_release_prod() {
+  valid APP "$NAME_RE"; valid PROJECT "$NAME_RE"; need ORG ACTOR API_TOKEN REGISTRY GITOPS_ACC_FILE GITOPS_PROD_FILE
+  [[ $ACTOR =~ $ACTOR_RE ]] || die "ACTOR has unexpected characters"
+  # a. membership
+  member_ok || die "REFUSED: $ACTOR is not an active member of $ORG/$ADMIN_GROUP (or membership could not be verified)"
+  gitops_clone; gitops_file "$GITOPS_ACC_FILE"; gitops_file "$GITOPS_PROD_FILE"
+  local prod="$GW/$GITOPS_PROD_FILE" cur subject hist
+  cur=$(rev_get "$prod")
+  # b. version: never typed in. Acc decides, or a rollback to a version prod already ran.
+  if [ -z "${ROLLBACK:-}" ]; then
+    VERSION=$(rev_get "$GW/$GITOPS_ACC_FILE")
+    is_semver "$VERSION" || die "REFUSED: acceptance has no X.Y.Z targetRevision (got '$VERSION')"
+  else
+    VERSION=$ROLLBACK
+    valid VERSION "$VER_RE"
+    # ponytail: matches any targetRevision line in the file history; fine while the file has one source
+    hist=$(git -C "$GW" log -p --format= -- "$GITOPS_PROD_FILE" | grep -E '^[-+][[:space:]]*targetRevision:' || true)
+    grep -qE "targetRevision:[[:space:]]*[\"']?${VERSION//./\\.}[\"']?[[:space:]]*\$" <<<"$hist" \
+      || die "REFUSED: $VERSION was never a production version of $APP; rollback only goes to a former production version"
+  fi
+  # c. artifacts exist
+  registry_login
+  skopeo inspect "docker://$REGISTRY/$PROJECT/$APP:$VERSION" >/dev/null 2>&1 \
+    || die "REFUSED: image $REGISTRY/$PROJECT/$APP:$VERSION does not exist"
+  skopeo inspect --raw "docker://$REGISTRY/$PROJECT/charts/$APP:$VERSION" >/dev/null 2>&1 \
+    || die "REFUSED: chart $REGISTRY/$PROJECT/charts/$APP:$VERSION does not exist"
+  # d. direction
+  if [ -z "${ROLLBACK:-}" ]; then
+    if is_semver "$cur" && ! ver_gt "$VERSION" "$cur"; then
+      die "REFUSED: production runs $cur; $VERSION is not newer. Use the rollback input to go back"
+    fi
+  else
+    # shellcheck disable=SC2015
+    is_semver "$cur" && ver_gt "$cur" "$VERSION" \
+      || die "REFUSED: rollback target $VERSION is not older than production ($cur)"
+  fi
+  # e. commit
+  rev_set "$prod" "$VERSION"
+  if [ -z "${ROLLBACK:-}" ]; then subject="release($APP): $VERSION to production by $ACTOR"
+  else subject="rollback($APP): $VERSION to production by $ACTOR"; fi
+  gitops_commit_push "$subject" "$GITOPS_PROD_FILE"
+  echo "$subject"
+}
+
+sub=${1:-}; shift || true
+case $sub in
+  version) cmd_version;;
+  push-tag) cmd_push_tag;;
+  check-title) cmd_check_title;;
+  guard-immutable) cmd_guard_immutable;;
+  build) cmd_build;;
+  publish) cmd_publish;;
+  gitops-acc) cmd_gitops_acc;;
+  release-prod) cmd_release_prod;;
+  *) die "usage: deployflow version|push-tag|check-title|guard-immutable|build|publish|gitops-acc|release-prod";;
+esac

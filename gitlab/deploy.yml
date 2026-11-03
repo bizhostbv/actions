@@ -1,0 +1,172 @@
+# deployflow for GitLab: MR title check, then on the default branch version -> build -> publish ->
+# gitops acceptance, plus a manual "release to production" job. Same script as the GitHub workflows.
+#
+# Include from a consumer repo (pin the release tag; it must match inputs.deployflow_version):
+#   include:
+#     - remote: https://raw.githubusercontent.com/bizhostbv/actions/<tag>/gitlab/deploy.yml
+#       inputs:
+#         project: myproject
+#         app: myapp
+#         gitops_repo: https://gitlab.example.org/myorg/my-gitops.git
+#         gitops_acc_file: apps/myapp/acceptance.yaml
+#         gitops_prod_file: apps/myapp/production.yaml
+#         org: myorg                       # GitLab group path that owns a subgroup "release-admins"
+#         deployflow_version: <tag>
+#
+# CI/CD variables the consumer sets (masked, protected where possible):
+#   DEPLOYFLOW_GITOPS_TOKEN    write access to the gitops repo
+#   DEPLOYFLOW_TAG_TOKEN       write access to this repo (pushes the version tag)
+#   DEPLOYFLOW_API_TOKEN       read access to the members of <org>/release-admins
+#   DEPLOYFLOW_REGISTRY_USER / DEPLOYFLOW_REGISTRY_PASSWORD   registry login (when the runner has none)
+#   DEPLOYFLOW_NPM_TOKEN       optional, mounted as build secret id=npm_token
+# Roll back: play the manual job with the variable ROLLBACK=X.Y.Z (a former production version).
+spec:
+  inputs:
+    project: { type: string }
+    app: { type: string }
+    registry: { type: string, default: registry.k8s-bizhost.nl }
+    dockerfile: { type: string, default: Dockerfile }
+    context: { type: string, default: . }
+    chart_dir: { type: string, default: chart }
+    gitops_repo: { type: string }
+    gitops_acc_file: { type: string }
+    gitops_prod_file: { type: string }
+    org: { type: string }
+    deployflow_version: { type: string }
+---
+stages: [check, version, build, publish, gitops, production]
+
+.deployflow:
+  image: registry.k8s-bizhost.nl/base/deployflow:$[[ inputs.deployflow_version ]]
+  variables:
+    PROJECT: $[[ inputs.project ]]
+    APP: $[[ inputs.app ]]
+    REGISTRY: $[[ inputs.registry ]]
+    REGISTRY_USER: $DEPLOYFLOW_REGISTRY_USER
+    REGISTRY_PASSWORD: $DEPLOYFLOW_REGISTRY_PASSWORD
+    GIT_SHA: $CI_COMMIT_SHA
+    RUN_URL: $CI_PIPELINE_URL
+  tags: [harbor-builder]
+
+# Jobs that need a release: variables `released` and `version` come from the version job's dotenv.
+.releasable:
+  extends: .deployflow
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+  before_script:
+    - '[ "${released:-}" = true ] || { echo "nothing to release"; exit 0; }'
+    - export VERSION="$version"
+
+deployflow-check-title:
+  extends: .deployflow
+  stage: check
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  variables:
+    TITLE: $CI_MERGE_REQUEST_TITLE
+  script:
+    - deployflow check-title
+
+deployflow-version:
+  extends: .deployflow
+  stage: version
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+  variables:
+    GIT_DEPTH: "0"
+    DEPLOYFLOW_OUTPUT: version.env
+  script:
+    - deployflow version
+    - |
+      if grep -qx 'released=true' version.env; then
+        VERSION=$(sed -n 's/^version=//p' version.env) deployflow guard-immutable
+      fi
+  artifacts:
+    reports:
+      dotenv: version.env
+
+.build:
+  extends: .releasable
+  stage: build
+  needs: [deployflow-version]
+  script:
+    - deployflow build
+
+deployflow-build-amd64:
+  extends: .build
+  variables:
+    ARCH: amd64
+    DOCKERFILE: $[[ inputs.dockerfile ]]
+    CONTEXT: $[[ inputs.context ]]
+    NPM_TOKEN: $DEPLOYFLOW_NPM_TOKEN
+    DEPLOYFLOW_OUTPUT: digest_amd64.env
+  tags: [harbor-builder]
+  artifacts:
+    reports:
+      dotenv: digest_amd64.env
+
+deployflow-build-arm64:
+  extends: .build
+  variables:
+    ARCH: arm64
+    DOCKERFILE: $[[ inputs.dockerfile ]]
+    CONTEXT: $[[ inputs.context ]]
+    NPM_TOKEN: $DEPLOYFLOW_NPM_TOKEN
+    DEPLOYFLOW_OUTPUT: digest_arm64.env
+  tags: [harbor-builder-arm64]
+  artifacts:
+    reports:
+      dotenv: digest_arm64.env
+
+deployflow-publish:
+  extends: .releasable
+  stage: publish
+  needs: [deployflow-version, deployflow-build-amd64, deployflow-build-arm64]
+  variables:
+    CHART_DIR: $[[ inputs.chart_dir ]]
+  script:
+    - export DIGEST_AMD64="$digest_amd64" DIGEST_ARM64="$digest_arm64"
+    - deployflow publish
+    # the tag goes on only after image and chart are in the registry
+    - git remote set-url origin "https://$CI_SERVER_FQDN/$CI_PROJECT_PATH.git"
+    - export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://$CI_SERVER_FQDN/.extraheader"
+    - export GIT_CONFIG_VALUE_0="Authorization: Basic $(printf 'oauth2:%s' "$DEPLOYFLOW_TAG_TOKEN" | base64 | tr -d '\n')"
+    - deployflow push-tag
+
+deployflow-gitops-acc:
+  extends: .releasable
+  stage: gitops
+  needs: [deployflow-version, deployflow-publish]
+  resource_group: deployflow-$[[ inputs.app ]]
+  variables:
+    GITOPS_REPO: $[[ inputs.gitops_repo ]]
+    GITOPS_ACC_FILE: $[[ inputs.gitops_acc_file ]]
+  script:
+    - export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.$GITOPS_REPO.extraheader"
+    - export GIT_CONFIG_VALUE_0="Authorization: Basic $(printf 'oauth2:%s' "$DEPLOYFLOW_GITOPS_TOKEN" | base64 | tr -d '\n')"
+    - deployflow gitops-acc
+
+deployflow-release-production:
+  extends: .deployflow
+  stage: production
+  needs: []
+  resource_group: deployflow-$[[ inputs.app ]]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+      when: manual
+      allow_failure: true
+  variables:
+    DEPLOYFLOW_PROVIDER: gitlab
+    ORG: $[[ inputs.org ]]
+    ACTOR: $GITLAB_USER_LOGIN
+    ACTOR_ID: $GITLAB_USER_ID
+    API_TOKEN: $DEPLOYFLOW_API_TOKEN
+    GITLAB_API_URL: $CI_API_V4_URL
+    GITOPS_REPO: $[[ inputs.gitops_repo ]]
+    GITOPS_ACC_FILE: $[[ inputs.gitops_acc_file ]]
+    GITOPS_PROD_FILE: $[[ inputs.gitops_prod_file ]]
+    ROLLBACK: ""
+  script:
+    - export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.$GITOPS_REPO.extraheader"
+    - export GIT_CONFIG_VALUE_0="Authorization: Basic $(printf 'oauth2:%s' "$DEPLOYFLOW_GITOPS_TOKEN" | base64 | tr -d '\n')"
+    - deployflow release-prod
