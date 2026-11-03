@@ -252,7 +252,7 @@ het niet meer alleen gcg is maar ook gwsn en bizhost".
 | Implementation | `bizhostbv/actions/deployflow/` | Shell scripts for each step: `version`, `build`, `push`, `gitops-acc`, `release-prod`. They take every project value as input. Nothing customer-specific is built in. |
 | Tool image | `registry.k8s-bizhost.nl/base/deployflow:X.Y.Z` | The scripts plus buildah, skopeo, helm, oras, yq and git. Built from the same repo with this same pipeline. |
 | GitHub wrapper | `bizhostbv/actions/.github/workflows/deploy.yml` | A reusable workflow. Each job calls a script. |
-| GitLab wrapper | `gitlab.com/bizhost/devops/deployflow` (public) | A CI/CD component (`templates/deploy.yml`). Each job runs in the tool image and calls the same script. |
+| GitLab wrapper | `bizhostbv/actions/gitlab/deploy.yml` | A CI template with `spec:inputs`, included with `include: remote` from the public repo at a release tag, so no GitLab project is needed. Each job runs in the tool image and calls the same script. |
 
 Both wrappers are versioned with the same `X.Y.Z` as the scripts, and a repo pins one version. The values each project
 passes:
