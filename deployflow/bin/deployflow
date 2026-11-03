@@ -61,7 +61,13 @@ gitops_clone() {
   git -C "$GW" config user.name "${GIT_USER_NAME:-deployflow}"
   git -C "$GW" config user.email "${GIT_USER_EMAIL:-deployflow@localhost}"
 }
-gitops_file() { [ -f "$GW/$1" ] || die "$1 does not exist in the gitops repo"; }
+gitops_file() {
+  [ -f "$GW/$1" ] || die "$1 does not exist in the gitops repo"
+  # Only bump an Application whose first source is this app's OCI chart: a git-path source would get a
+  # targetRevision X.Y.Z that does not exist as a git ref, and the app would stop syncing.
+  local c; c=$(yq e '.spec.sources[0].chart // ""' "$GW/$1")
+  [ "$c" = "$APP" ] || die "$1: sources[0] is not the OCI chart '$APP' (chart: '$c'); convert the Application first"
+}
 gitops_commit_push() { # $1 = subject, $2 = file
   git -C "$GW" add "$2"
   git -C "$GW" commit -q -m "$1" -m "${RUN_URL:-no run url}"

@@ -184,7 +184,8 @@ assert "publish: bad digest fails" test "$RC" -eq 1
 
 # --- gitops fixtures -----------------------------------------------------------------------
 ACC=gwsn/app/argocd/acceptance.yaml; PROD=gwsn/app/argocd/production.yaml
-appfile() { mkdir -p "$(dirname "$1")"; printf 'spec:\n  sources:\n    - repoURL: x\n      targetRevision: %s\n' "$2" > "$1"; }
+appfile() { mkdir -p "$(dirname "$1")"; printf 'spec:\n  sources:\n    - repoURL: x\n      chart: app\n      targetRevision: %s\n' "$2" > "$1"; }
+gitpathfile() { printf 'spec:\n  sources:\n    - repoURL: x\n      path: gwsn/app/chart\n      targetRevision: main\n' > "$1"; }
 mkgitops() { # mkgitops <acc> <prod history, oldest first...>
   local acc=$1; shift
   G=$(mktemp -d "$T/gitops.XXXX"); git init -q --bare -b main "$G/remote.git"; git clone -q "$G/remote.git" "$G/w" 2>/dev/null
@@ -222,6 +223,13 @@ reset; mkgitops 1.0.0 1.0.0; printf '#!/bin/sh\nexit 1\n' > "$G/remote.git/hooks
 run env "${GENV[@]}" GITOPS_REPO="$G/remote.git" "$DF" gitops-acc
 assert "gitops-acc: gives up after 3 attempts" sh -c "test $RC -eq 1" 
 assert "gitops-acc: gives up message" has "$OUT" "after 3 attempts"
+
+reset; mkgitops 1.0.0 1.0.0; gitpathfile "$G/w/$ACC"; git -C "$G/w" commit -qam "git path source"; git -C "$G/w" push -q origin HEAD:main
+n=$(rcount); run env "${GENV[@]}" GITOPS_REPO="$G/remote.git" "$DF" gitops-acc
+assert "gitops-acc: git-path source refused, no commit" sh -c "test $RC -eq 1 && test $(rcount) -eq $n"
+assert "gitops-acc: git-path source says convert" has "$OUT" "convert the Application first"
+reset; mkgitops 1.0.0 1.0.0; n=$(rcount); run env "${GENV[@]}" APP=other GITOPS_REPO="$G/remote.git" "$DF" gitops-acc
+assert "gitops-acc: another app's chart refused, no commit" sh -c "test $RC -eq 1 && test $(rcount) -eq $n"
 
 # --- release-prod --------------------------------------------------------------------------
 setup_rp() { # setup_rp <acc> <prod history...>
@@ -302,6 +310,10 @@ setup_rp 1.3.0 1.0.0 1.1.0 1.2.0; rp ROLLBACK=1.1.0
 assert "release-prod: rollback with missing artifacts refused" has "$OUT" "does not exist"
 setup_rp 1.3.0 1.0.0 1.1.0 1.2.0; art 1.1.0; rp ROLLBACK=1.1.0 STUB_X=1 DEPLOYFLOW_PROVIDER=github ACTOR='eve bad'
 assert "release-prod: odd ACTOR refused" test "$RC" -eq 1
+
+setup_rp 1.1.0 1.0.0; art 1.1.0; gitpathfile "$G/w/$PROD"; git -C "$G/w" commit -qam "git path source"; git -C "$G/w" push -q origin HEAD:main; N0=$(rcount); rp
+assert "release-prod: git-path production source refused" sh -c "test $RC -eq 1"
+assert "release-prod: git-path production source leaves gitops untouched" untouched
 
 # The reusable workflows fetch the script at DEPLOYFLOW_REF: one release tag in all three, never a branch.
 WF="$(dirname "$0")/../../.github/workflows"
