@@ -4,9 +4,21 @@ Status: approved by the lead on 3 Nov 2026. The shared pipeline (§8) is being b
 workflows and [`DEPLOYMENTS.md`](DEPLOYMENTS.md) keep working; this document then replaces `DEPLOYMENTS.md`.
 This repo is public, so this document names no IP addresses, secrets or customer internals.
 
-**Scope.** This is the baseline for every application on the `gwsn-production` cluster: GCG (Connect, shop, Product
-Manager, website, cdn), Bizhost-internal apps, and customer projects as
-they move there. Lead, 3 Nov 2026:
+**Scope.** This is the baseline for every application on the `gwsn-production` cluster: Bizhost-internal apps,
+customer projects and GCG, as they move there.
+
+**The typical application** is a standard PHP application (Symfony or Laravel type) with:
+- a web Deployment, either FrankenPHP or nginx + php-fpm;
+- queue workers;
+- CronJobs;
+- a migrations Job;
+- Redis;
+- an external database.
+
+Everything in this document is written for that case first. Node services fit the same flow. Applications that ship
+binaries to devices use the optional [Appendix A](#appendix-a-edge-binaries-optional).
+
+Lead, 3 Nov 2026:
 - "dit geld dus voor voor alle projecten die op gwsn cluster draaien dat dit de basis wordt";
 - "de deployflow wil ik voor alle applicaties zo goed als hetzelfde hebben".
 
@@ -57,12 +69,6 @@ Rules that apply to every step:
 | Concurrency | One concurrency group per app. The gitops push rebases and retries. |
 | Audit | Commit message `release(<app>): X.Y.Z to production by <actor>`, plus a link to the run. The git history of `production.yaml` is the release log. |
 
-### 1.2 Edge binaries (for example the Connect connector)
-
-- **Same pipeline.** Steps 1–3 run as for any service, but the artifact is signed binaries, pushed to harbor as an OCI
-  artifact (oras).
-- **Step 4** commits the version to acc.
-- **Step 5** marks `X.Y.Z` as `stable` in the application's release source. Devices only install `stable`.
 
 ## 2. Tenancy: what every customer or product gets
 
@@ -115,9 +121,39 @@ gwsn/<app>/environments/<env>/manifests/            # SopsSecret and other plain
 
   All are Debian slim, built for amd64 and arm64, rebuilt weekly behind a Trivy gate. `bizhost/devops/base-images`
   (GitLab) is retired.
-- **Pinning.** Services pin `tag@sha256:digest`. Renovate (shared preset) bumps the pin; every repo opts in.
+- **Pinning.** Services pin `tag@sha256:digest`.
 - **User.** Runtime images run as uid 1000.
 - **Tags.** `X.Y.Z` is immutable in harbor. Non-release artifacts are deleted after 30 days.
+
+### 4.1 Dependencies: Renovate with a cooldown
+
+Lead, 3 Nov 2026: "niet alleen base images maar ook node modules en composer. wel met een cooldown, we willen niet een
+geinfecteerde package dezelfde dag nog geinstalleerd is op ons cluster. een renovate mag na alle testen op groen
+automatisch gemerged worden op main."
+
+- **Coverage.** Every app repo extends the shared Renovate preset, which moves to a Bizhost-owned public repo so that
+  GitHub and GitLab repos use the same one. Renovate covers base images, npm, composer, the shared workflow or template
+  pin, and the `app` chart dependency.
+- **Cooldown.** Every update waits `minimumReleaseAge` before Renovate offers it, so no package reaches the cluster on
+  the day it was published.
+
+  | Update | Cooldown | Automerge after green checks |
+  |---|---|---|
+  | patch, minor, digest (npm, composer, docker, actions) | 3 days | yes |
+  | own base images (`base/*`, already filtered upstream) | none | yes |
+  | security fix (vulnerability alert) | 1 day | yes |
+  | major | 3 days | no, a person merges (recommended; the lead may choose automerge for majors too) |
+
+- **Security fixes wait 1 day.** The trade-off: a known vulnerability stays open on the cluster for up to a day longer.
+  In exchange, a hijacked "security" release, a common attack pattern, does not reach the cluster on its release day.
+  For a vulnerability that is being actively exploited, a person can merge the Renovate PR before the day is over.
+- **PR titles.** Renovate uses conventional titles (`semanticCommits`): `fix(deps): …` and `chore(deps): …` release as
+  a patch.
+- **Automerge.** A Renovate PR that is green merges by itself, and that merge releases to acc like any other. Prod
+  stays the manual production job.
+- **Limit.** The cooldown covers the dependency Renovate bumps and its lockfile changes. It does not check the age of
+  every transitive package that a fresh lockfile resolves. Lockfile maintenance therefore stays manual (no automerge),
+  and the app's CI runs `npm audit` / `composer audit` plus the image scan.
 
 ## 5. Chart
 
@@ -133,7 +169,35 @@ The library chart renders the standard resources:
 - VMServiceScrape
 - ServiceAccount
 
-Apps only add what is their own: workers, migrations, CronJobs.
+For the typical PHP application, the same chart also renders, from the same image:
+- **workers:** one Deployment per worker, KEDA on queue depth;
+- **cronjobs:** one CronJob each, with `concurrencyPolicy: Forbid` and history limits;
+- **migrations:** a Job run as an ArgoCD `PreSync` hook with `BeforeHookCreation`, `backoffLimit: 0` and no TTL.
+
+Apps only add templates for what really is their own.
+
+```yaml
+# values for a typical PHP application
+image: { repository: registry.k8s-bizhost.nl/<customer>/<app> }   # tag is set by the pipeline
+ports: [{ name: http, containerPort: 8080 }]
+metrics: { port: 2019 }
+readinessProbe: { httpGet: { path: /readyz, port: http } }
+livenessProbe:  { httpGet: { path: /healthz, port: http } }
+resources: { requests: { cpu: 100m, memory: 256Mi } }
+envFrom: [{ secretRef: { name: <app>-env } }]
+autoscaling: { hpa: { enabled: true, minReplicas: 2, maxReplicas: 6 } }
+ingress: { hosts: [{ host: <app>.example.org, paths: [{ path: / }] }] }
+workers:
+  messenger:
+    command: [php, bin/console, messenger:consume, async, --time-limit=3600]
+    resources: { requests: { cpu: 50m, memory: 192Mi } }
+    keda: { minReplicaCount: 1, maxReplicaCount: 10, triggers: [ ... ] }
+cronjobs:
+  cleanup: { schedule: "15 3 * * *", command: [php, bin/console, app:cleanup], resources: { requests: { cpu: 50m, memory: 128Mi } } }
+migrations:
+  command: [php, bin/console, doctrine:migrations:migrate, --no-interaction]
+  resources: { requests: { cpu: 100m, memory: 256Mi } }
+```
 
 Defaults that make the platform rules the easy path:
 - **Rollout.** `RollingUpdate`, `maxUnavailable: 0`, `maxSurge: 1`.
@@ -218,3 +282,14 @@ Rules that apply to all groups:
 - Harbor and ArgoCD map the same groups through SSO group claims (`<org>:<group>`). The ArgoCD AppProject of a customer
   only grants that customer's groups.
 - Owners of the orgs and groups (Bizhost) sit outside this matrix.
+
+## Appendix A. Edge binaries (optional)
+
+This appendix applies only to applications that ship binaries to devices, such as the Connect connector. Standard
+applications skip it.
+
+- **Same pipeline.** Steps 1–3 run as for any service, but the artifact is signed binaries, pushed to harbor as an OCI
+  artifact (oras).
+- **Step 4** commits the version to acc.
+- **Step 5** is the production job. It marks `X.Y.Z` as `stable` in the application's release source, and devices only
+  install `stable`.
