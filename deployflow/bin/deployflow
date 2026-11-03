@@ -179,6 +179,8 @@ cmd_publish() {
   [ "$(yq e '.name' "$chart/Chart.yaml")" = "$APP" ] || die "chart name in $CHART_DIR/Chart.yaml must equal $APP"
   V=$VERSION yq e -i '.image.tag = strenv(V)' "$chart/values.yaml"
   mkdir "$TMP/pkg"
+  # app charts depend on the shared library chart (oci://<registry>/base/charts/app)
+  if [ "$(yq e '.dependencies | length' "$chart/Chart.yaml")" != 0 ]; then helm dependency build "$chart"; fi
   helm package "$chart" --version "$VERSION" --app-version "$VERSION" -d "$TMP/pkg"
   helm push "$TMP/pkg/$APP-$VERSION.tgz" "oci://$REGISTRY/$PROJECT/charts"
   echo "published $img and chart $VERSION"

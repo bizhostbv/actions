@@ -167,7 +167,12 @@ assert "publish: pushes manifest list :1.0.0" grep -q 'buildah manifest push --a
 assert "publish: packages with version and app-version" grep -q 'helm package .* --version 1.0.0 --app-version 1.0.0' "$STUB_LOG"
 assert "publish: bakes image.tag into the packaged chart" grep -qx '  tag: 1.0.0' "$STUB_LOG"
 assert "publish: leaves the source chart untouched" grep -qx '  tag: latest' "$CH/values.yaml"
+assert "publish: no dependency build without dependencies" test -z "$(grep 'helm dependency build' "$STUB_LOG")"
 assert "publish: pushes chart to charts path" grep -q 'helm push .*app-1.0.0.tgz oci://reg.example/proj/charts' "$STUB_LOG"
+printf 'dependencies:\n  - name: app\n    version: 1.0.0\n    repository: oci://reg.example/base/charts\n' >> "$CH/Chart.yaml"
+reset; art 1.0.0; echo '{"manifests":[{"platform":{"architecture":"amd64"}},{"platform":{"architecture":"arm64"}}]}' > "$S/manifest.json"; pub
+assert "publish: builds dependencies of a chart that has them" grep -q 'helm dependency build' "$STUB_LOG"
+printf 'name: app\nversion: 0.0.0\n' > "$CH/Chart.yaml"
 reset; art 1.0.0; echo '{"manifests":[{"platform":{"architecture":"amd64"}}]}' > "$S/manifest.json"; pub
 assert "publish: missing arm64 fails" test "$RC" -eq 1
 assert "publish: missing arm64 pushes no chart" test -z "$(grep 'helm push' "$STUB_LOG")"
