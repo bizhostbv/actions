@@ -173,14 +173,22 @@ de oude repo mag pas weg als niemand die base images meer gebruikt".
   - A reference Renovate cannot read is not tracked and gets no switch PR: a `FROM` built from several `ARG`s, or an
     image name in a CI variable. Those consumers are listed in the inventory and moved by hand, and their new
     reference is written so that Renovate can read it (a literal `image:tag@sha256:digest`).
-- **Harbor project `base` is private.** Every reader logs in; nothing pulls `base` anonymously.
+- **Harbor project `base` is private.** Every reader logs in; nothing pulls `base` anonymously. Lead, 4 Nov 2026:
+  "ik ga hem alleen liever niet publiek maken", "graag en we moeten zorgen dat op gitlab op CI niveau
+  (gitlab.com/bizhost, gitlab.com/gwsn, gitlab.com/globalcontrolgroup) er group variable komen waar we de image pull
+  secret in hebben. het zelfde geld voor github. dan is de registry private en kunnen we er toch gemakkelijk bij" and
+  "met 50+ repo's is het anders te veel werk om handmatig users aan te maken".
   - **Clusters.** The node-level registry robots (`registries.yaml`, `robot$cluster-<cluster>`) get pull on `base`.
     Manifests need no change for `base`. The per-namespace `harbor-pull` secret stays for the customer's own project
     (§2).
   - **CI pulls** (a `FROM base/...` in a build, a job image) use `HARBOR_PULL_USER` / `HARBOR_PULL_PASSWORD`, masked and
     not protected, so branch and MR pipelines can build too:
-    - GitLab: group variables on each top-level group that builds images;
-    - GitHub: org secrets with the same names on each org that builds images.
+    - GitLab: group variables on the top-level groups `bizhost`, `gwsn` and `globalcontrolgroup`;
+    - GitHub: org secrets with the same names on the orgs `bizhostbv`, `gwsn` and `globalcontrolgroup` (set by an org
+      admin).
+
+    One shared, read-only robot serves all of CI: either an existing group-level pull robot gets pull on `base`, or a
+    dedicated `robot$base+pull` replaces it. That choice is the lead's.
 
     A GitLab job whose own `image:` comes from `base` (the GitLab wrapper's `base/deployflow`, §8) also needs
     `DOCKER_AUTH_CONFIG` for that registry, because the runner pulls the job image before any script runs.
