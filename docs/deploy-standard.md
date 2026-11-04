@@ -122,6 +122,9 @@ base-images voor bizhost en gcg apart hebben gemaakt. we moeten dus apart franke
 is de base images op github geen issue maar houd er rekening mee dat we op veel repositories gebruik maken van bizhost
 base images! en dat ze ten alle tijden op arm en x64 moeten werken".
 
+Lead, 4 Nov 2026: "en vergeet renovate niet op de base images als je de repo veranderd dan moeten we dat ook mee nemen.
+de oude repo mag pas weg als niemand die base images meer gebruikt".
+
 - **One base-image source for the whole cluster.** The `base-images` repo (today
   `globalcontrolgroup/base-images`) moves to `bizhostbv/base-images` and pushes to harbor project `base`:
   - `php-base`: plain PHP for the nginx + php-fpm case, **not** FrankenPHP. It takes over the role of the Bizhost
@@ -154,8 +157,22 @@ base images! en dat ze ten alle tijden op arm en x64 moeten werken".
      it.
   3. **Move consumers.** Each consumer moves to the matching `base/*` image in its own change, through its normal
      release (an acc deploy before prod).
-  4. **Retire.** Only when the list is empty: stop the schedule, archive the repo, and remove the images after a grace
-     period. The same rule applies to `gcg/php-base` and `gcg/node-base` once their consumers move to `base/*`.
+  4. **Retire.** Only when the inventory shows zero consumers: stop the schedule, archive the repo, and remove the
+     images after a grace period. Until then the old images keep being built on both architectures.
+
+  This holds for every old source: `bizhost/hosting/base-images` and `bizhost/devops/base-images` on GitLab, and
+  `globalcontrolgroup/base-images` with its `gcg/php-base` and `gcg/node-base` images on harbor.
+- **Renovate moves with the image.** A consumer must never stop getting base-image updates without anyone noticing.
+  - The change that moves an image to `registry.k8s-bizhost.nl/base/<image>` also changes the shared Renovate
+    preset(s) (§4.1), so Renovate keeps tracking the new path: the custom regex manager for digest pins outside a
+    `FROM` line, and the base-image `packageRules` (grouping, automerge, the cooldown of the §4.1 table).
+  - The same change adds a replacement rule (`replacementName`, plus `replacementVersion` where the tag scheme
+    changes) from each old image to its new one. Renovate then opens the switch PR in every consumer itself, with
+    the new image pinned on digest. A switch PR changes what runs, so it is a `fix(deps)` that releases to acc; it
+    does not automerge, a person merges it.
+  - A reference Renovate cannot read is not tracked and gets no switch PR: a `FROM` built from several `ARG`s, or an
+    image name in a CI variable. Those consumers are listed in the inventory and moved by hand, and their new
+    reference is written so that Renovate can read it (a literal `image:tag@sha256:digest`).
 - **Pinning.** Services pin `tag@sha256:digest`.
 - **User.** Runtime images run as uid 1000.
 - **Tags.** `X.Y.Z` is immutable in harbor. Non-release artifacts are deleted after 30 days.
