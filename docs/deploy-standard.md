@@ -117,14 +117,45 @@ gwsn/<app>/environments/<env>/manifests/            # SopsSecret and other plain
 
 ## 4. Images
 
+Lead, 4 Nov 2026: "niet alle php images die de base images gebruiken is frankenphp, dat is dus de reden dat we
+base-images voor bizhost en gcg apart hebben gemaakt. we moeten dus apart franken-php-base maken naast php-base. dan
+is de base images op github geen issue maar houd er rekening mee dat we op veel repositories gebruik maken van bizhost
+base images! en dat ze ten alle tijden op arm en x64 moeten werken".
+
 - **One base-image source for the whole cluster.** The `base-images` repo (today
   `globalcontrolgroup/base-images`) moves to `bizhostbv/base-images` and pushes to harbor project `base`:
-  - `php-base` (FrankenPHP)
+  - `php-base`: plain PHP for the nginx + php-fpm case, **not** FrankenPHP. It takes over the role of the Bizhost
+    GitLab images `base-php-fpm-8x` / `php-fpm-prod-8x`: `php:8.x-fpm` on Debian (bookworm), with the extensions
+    those images carry today (exif, mbstring, pdo_mysql, intl, opcache, gd with freetype/jpeg, zip, soap, imagick,
+    igbinary, redis) and composer. Tooling that the current images bundle for convenience (Symfony CLI, sops, age,
+    editors) is not part of the base; an app that needs it adds it in its own Dockerfile.
+  - `frankenphp-base`: FrankenPHP, the current GCG image (`globalcontrolgroup/base-images`, today pushed as
+    `gcg/php-base`). Not every PHP application runs on FrankenPHP, which is why it is a separate image.
   - `node-base`
   - `nginx-base` (new)
 
-  All are Debian slim, built for amd64 and arm64, rebuilt weekly behind a Trivy gate. `bizhost/devops/base-images`
-  (GitLab) is retired.
+  Each image has one major per tag line (`php-base:8.4`, `frankenphp-base:8.4`, `node-base:22`), and the tag says what
+  the image runs: a `node-base:22` built from Node 26 is a defect. All are Debian based and rebuilt weekly behind a
+  Trivy gate.
+- **Every image is multi-arch, always.** The cluster runs amd64 and arm64 nodes, so every image (base images, app
+  images, tool images) is published as one tag over a manifest list with `linux/amd64` and `linux/arm64`. This is a
+  hard rule:
+  - each architecture is built natively on its own runner (§8), not under emulation;
+  - a build that does not produce both architectures is red, and its tag is not pushed;
+  - nothing inside an image may be architecture-specific by accident: binaries downloaded during the build pick the
+    file for the build's own architecture (`TARGETARCH` or `dpkg --print-architecture`), never a fixed `amd64`.
+- **Retiring the Bizhost GitLab base images is a migration, not a switch.** Many Bizhost repos build on the images from
+  `bizhost/hosting/base-images` (and the older `bizhost/devops/base-images`) on GitLab. They are retired in this
+  order, and not before:
+  1. **Inventory.** List every consumer (repo, file, image, tag) on GitLab and GitHub and keep the list with the
+     migration work.
+  2. **Keep building.** The old images stay built on their schedule and pullable, with their current names and tags,
+     until the last consumer has moved. No image is removed and no schedule is stopped while the list has an entry for
+     it.
+  3. **Move consumers.** Each consumer moves to the matching `base/*` image in its own change, through its normal
+     release (an acc deploy before prod).
+  4. **Retire.** Only when the list is empty: stop the schedule, archive the repo, and remove the images after a grace
+     period. The same rule applies to `gcg/php-base` and `gcg/node-base` once their consumers move to `base/*`.
 - **Pinning.** Services pin `tag@sha256:digest`.
 - **User.** Runtime images run as uid 1000.
 - **Tags.** `X.Y.Z` is immutable in harbor. Non-release artifacts are deleted after 30 days.
