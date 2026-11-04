@@ -22,7 +22,9 @@ raw=0; ref=""
 for a in "$@"; do case $a in --raw) raw=1;; docker://*) ref=${a#docker://};; esac; done
 [ "$1" = inspect ] || exit 0
 grep -qxF "$ref" "$STUB_DIR/exists" 2>/dev/null || exit 1
-if [ $raw = 1 ] && [ -f "$STUB_DIR/manifest.json" ]; then cat "$STUB_DIR/manifest.json"; else echo '{}'; fi
+if [ $raw = 1 ] && [ -f "$STUB_DIR/manifest.json" ]; then cat "$STUB_DIR/manifest.json"
+elif [ $raw = 0 ] && [ -f "$STUB_DIR/arch_${ref#*@}" ]; then printf '{"Architecture":"%s"}\n' "$(cat "$STUB_DIR/arch_${ref#*@}")"
+else echo '{}'; fi
 X
 cat > "$S/buildah" <<'X'
 #!/bin/sh
@@ -64,7 +66,7 @@ assert() { # assert <description> <command...>
 }
 run() { OUT=$(cd "${RUNDIR:-$PWD}" && "$@" 2>&1) && RC=0 || RC=$?; }
 has() { case $1 in *"$2"*) return 0;; esac; return 1; }
-reset() { : > "$STUB_LOG"; : > "$S/exists"; rm -f "$S/manifest.json"; unset STUB_CURL_FAIL STUB_CURL_BODY STUB_CURL_CODE STUB_ARCH; RUNDIR=; }
+reset() { : > "$STUB_LOG"; : > "$S/exists"; rm -f "$S/manifest.json" "$S"/arch_*; unset STUB_CURL_FAIL STUB_CURL_BODY STUB_CURL_CODE STUB_ARCH; RUNDIR=; }
 art() { echo "reg.example/proj/app:$1" >> "$S/exists"; echo "reg.example/proj/charts/app:$1" >> "$S/exists"; }
 ENV0=(PROJECT=proj APP=app REGISTRY=reg.example)
 
@@ -172,8 +174,11 @@ assert "build: NPM_TOKEN becomes a build secret, never printed" sh -c "grep -q -
 D1=sha256:1111111111111111111111111111111111111111111111111111111111111111
 D2=sha256:2222222222222222222222222222222222222222222222222222222222222222
 CH="$T/chart"; mkdir -p "$CH"; printf 'name: app\nversion: 0.0.0\n' > "$CH/Chart.yaml"; printf 'image:\n  tag: latest\n' > "$CH/values.yaml"
+# arches <arch of D1> <arch of D2>: what the registry holds under each per-arch digest ("-" = absent)
+arches() { local d a; for d in "$D1:$1" "$D2:$2"; do a=${d##*:}; d=${d%:*}; [ "$a" = - ] && continue
+  echo "reg.example/proj/app@$d" >> "$S/exists"; echo "$a" > "$S/arch_$d"; done; }
 pub() { run env "${ENV0[@]}" VERSION=1.0.0 DIGEST_AMD64=$D1 DIGEST_ARM64=$D2 CHART_DIR="$CH" "$@" "$DF" publish; }
-reset; art 1.0.0; echo '{"manifests":[{"platform":{"architecture":"amd64"}},{"platform":{"architecture":"arm64"}}]}' > "$S/manifest.json"; pub
+reset; art 1.0.0; arches amd64 arm64; echo '{"manifests":[{"platform":{"architecture":"amd64"}},{"platform":{"architecture":"arm64"}}]}' > "$S/manifest.json"; pub
 assert "publish: succeeds with both arches" test "$RC" -eq 0
 assert "publish: joins both digests" sh -c "grep -c 'buildah manifest add' '$STUB_LOG' | grep -qx 2"
 assert "publish: pushes manifest list :1.0.0" grep -q 'buildah manifest push --all .* docker://reg.example/proj/app:1.0.0' "$STUB_LOG"
@@ -183,13 +188,25 @@ assert "publish: leaves the source chart untouched" grep -qx '  tag: latest' "$C
 assert "publish: no dependency build without dependencies" test -z "$(grep 'helm dependency build' "$STUB_LOG")"
 assert "publish: pushes chart to charts path" grep -q 'helm push .*app-1.0.0.tgz oci://reg.example/proj/charts' "$STUB_LOG"
 printf 'dependencies:\n  - name: app\n    version: 1.0.0\n    repository: oci://reg.example/base/charts\n' >> "$CH/Chart.yaml"
-reset; art 1.0.0; echo '{"manifests":[{"platform":{"architecture":"amd64"}},{"platform":{"architecture":"arm64"}}]}' > "$S/manifest.json"; pub
+reset; art 1.0.0; arches amd64 arm64; echo '{"manifests":[{"platform":{"architecture":"amd64"}},{"platform":{"architecture":"arm64"}}]}' > "$S/manifest.json"; pub
 assert "publish: builds dependencies of a chart that has them" grep -q 'helm dependency build' "$STUB_LOG"
 printf 'name: app\nversion: 0.0.0\n' > "$CH/Chart.yaml"
-reset; art 1.0.0; echo '{"manifests":[{"platform":{"architecture":"amd64"}}]}' > "$S/manifest.json"; pub
-assert "publish: missing arm64 fails" test "$RC" -eq 1
-assert "publish: missing arm64 pushes no chart" test -z "$(grep 'helm push' "$STUB_LOG")"
-reset; art 1.0.0; echo '{"manifests":[{"platform":{"architecture":"amd64"}},{"platform":{"architecture":"arm64"}}]}' > "$S/manifest.json"
+reset; art 1.0.0; arches amd64 arm64; echo '{"manifests":[{"platform":{"architecture":"amd64"}}]}' > "$S/manifest.json"; pub
+assert "publish: tag serving only amd64 fails" test "$RC" -eq 1
+assert "publish: tag serving only amd64 pushes no chart" test -z "$(grep 'helm push' "$STUB_LOG")"
+# deploy standard §4: both architectures are checked before the tag is pushed
+reset; art 1.0.0; arches amd64 amd64; pub
+assert "publish: arm64 digest holding an amd64 image fails" test "$RC" -eq 1
+assert "publish: wrong arm64 names the digest" has "$OUT" "DIGEST_ARM64 is 'amd64', expected arm64; no tag pushed"
+assert "publish: wrong arm64 pushes no tag" test -z "$(grep 'buildah manifest push' "$STUB_LOG")"
+assert "publish: wrong arm64 pushes no chart" test -z "$(grep 'helm push' "$STUB_LOG")"
+reset; art 1.0.0; arches amd64 -; pub
+assert "publish: missing arm64 digest fails" test "$RC" -eq 1
+assert "publish: missing arm64 digest pushes no tag" test -z "$(grep 'buildah manifest push' "$STUB_LOG")"
+reset; art 1.0.0; arches arm64 amd64; pub
+assert "publish: swapped digests fail" test "$RC" -eq 1
+assert "publish: swapped digests push no tag" test -z "$(grep 'buildah manifest push' "$STUB_LOG")"
+reset; art 1.0.0; arches amd64 arm64; echo '{"manifests":[{"platform":{"architecture":"amd64"}},{"platform":{"architecture":"arm64"}}]}' > "$S/manifest.json"
 run env "${ENV0[@]}" APP=other VERSION=1.0.0 DIGEST_AMD64=$D1 DIGEST_ARM64=$D2 CHART_DIR="$CH" "$DF" publish
 assert "publish: chart name must equal APP" test "$RC" -eq 1
 pub DIGEST_ARM64=nonsense

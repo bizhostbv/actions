@@ -31,7 +31,7 @@ on:
 
 env:
   # Where the deployflow scripts come from. Releases of this repo pin it to their own release tag.
-  DEPLOYFLOW_REF: v3.1.2 # must equal the release tag; bump it in the release PR
+  DEPLOYFLOW_REF: v3.1.3 # must equal the release tag; bump it in the release PR
 
 concurrency:
   group: deploy-${{ github.repository }}
