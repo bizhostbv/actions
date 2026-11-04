@@ -87,7 +87,20 @@ vtest() { # vtest <desc> <expected-version|none> <tag-or-empty> <commit subject>
     assert "version: $desc tag is annotated" test "$(git -C "$APPDIR" cat-file -t "$want")" = tag
   fi
 }
-vtest "no tags, feat" 0.1.0 "" "feat: a"
+vtest "baseline 0.0.0, feat" 0.1.0 0.0.0 "feat: a"
+# no version tag reachable from HEAD: refuse, never start at 0.0.0
+notag() { # notag <desc> ; APPDIR prepared by the caller
+  local before; before=$(git -C "$APPDIR" tag -l)
+  RUNDIR=$APPDIR; run env DEPLOYFLOW_OUTPUT="$APPDIR.out" "$DF" version
+  assert "version: $1 is refused" test "$RC" -ne 0
+  assert "version: $1 names the baseline tag" has "$OUT" "set a baseline tag"
+  assert "version: $1 creates no tag" test "$(git -C "$APPDIR" tag -l)" = "$before"
+  assert "version: $1 writes no version output" sh -c "! grep -q '^version=' '$APPDIR.out' 2>/dev/null"
+}
+reset; mkapp; c "feat: a"; notag "no tags at all"
+reset; mkapp; git -C "$APPDIR" tag ps2024007/v3.0.17; c "feat: a"; notag "only a prefixed tag"
+reset; mkapp; git -C "$APPDIR" switch -q -c side; c "fix: side"; git -C "$APPDIR" tag 1.2.3
+git -C "$APPDIR" switch -q main; c "feat: a"; notag "tag only on another branch"
 vtest "feat bumps minor (v tag)" 1.3.0 v1.2.3 "feat(x): a" "fix: b"
 vtest "fix bumps patch (v tag)" 1.2.4 v1.2.3 "fix: a" "chore: b"
 vtest "fix bumps patch (tag without v)" 1.2.4 1.2.3 "fix: a"

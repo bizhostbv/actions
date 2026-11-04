@@ -86,11 +86,11 @@ cmd_version() {
   # existing tags may or may not carry a v; compare on the bare number. New tags never get a v.
   local base tag range subjects bodies bump maj min pat new
   base=$(git tag --list --merged HEAD | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | sort -V | tail -n1 || true)
-  if [ -z "$base" ]; then base=0.0.0; range=HEAD
-  else
-    tag=$base; git rev-parse -q --verify "refs/tags/$tag" >/dev/null || tag="v$base"
-    range="$tag..HEAD"
-  fi
+  # No silent start at 0.0.0: for an existing app that gives 0.1.0/1.0.0, which guard-immutable refuses
+  # or which sends prod to 1.0.0. A brand-new repo tags 0.0.0 once.
+  [ -n "$base" ] || die "no version tag (X.Y.Z) reachable from HEAD; set a baseline tag X.Y.Z on the commit the current release came from (a brand-new repo tags 0.0.0 once)"
+  tag=$base; git rev-parse -q --verify "refs/tags/$tag" >/dev/null || tag="v$base"
+  range="$tag..HEAD"
   subjects=$(git log "$range" --no-merges --format='%s' || true)
   bodies=$(git log "$range" --no-merges --format='%b' || true)
   bump=none

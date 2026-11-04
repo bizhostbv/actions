@@ -8,7 +8,7 @@ gitops repo, then a manual production job that bumps production to the version a
 ## Subcommands
 | Command | Does |
 |---|---|
-| `version` | Next X.Y.Z from commit subjects since the latest tag (feat minor, fix patch, `!`/BREAKING CHANGE major, 0.x major becomes minor). Tags have no `v`; old `v` tags are read. Prints `none` and `released=false` when nothing is releasable. |
+| `version` | Next X.Y.Z from commit subjects since the latest tag (feat minor, fix patch, `!`/BREAKING CHANGE major, 0.x major becomes minor). Tags have no `v`; old `v` tags are read. Refuses when no `X.Y.Z` tag is reachable from HEAD: an existing app tags its current version on the commit it came from, a brand-new repo tags `0.0.0` once. Prints `none` and `released=false` when nothing is releasable. |
 | `push-tag` | Pushes tag `$VERSION` (creates it on HEAD if missing). Runs after `publish`. |
 | `check-title` | Fails unless `$TITLE` is a conventional commit title. |
 | `guard-immutable` | Fails if image or chart `$VERSION` already exists in the registry. |
