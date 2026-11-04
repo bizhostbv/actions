@@ -81,7 +81,7 @@ differ.
 | Thing | Name | Example (GCG) |
 |---|---|---|
 | Harbor project (images, `charts/`, edge artifacts) | `<customer>` | `gcg` (Connect included) |
-| Harbor robots | `<customer>-push` (CI), `<customer>-pull` (cluster) | `gcg-push`, `gcg-pull` |
+| Harbor robots | `<customer>-push` (CI; also pull on `base`, see §4), `<customer>-pull` (cluster) | `gcg-push`, `gcg-pull` |
 | Namespaces | `<customer>[-<product>]-<env>`, env `acc` or `prod` | `gcg-acc`, `gcg-connect-prod` |
 | Pull secret in every namespace | SopsSecret `harbor-pull` (from `<customer>-pull`) | |
 | Gitops repo | one per customer, `<customer>-gitops`, in the customer's GitHub org or GitLab group | `gcg-gitops-repo` (existing name stays) |
@@ -173,6 +173,26 @@ de oude repo mag pas weg als niemand die base images meer gebruikt".
   - A reference Renovate cannot read is not tracked and gets no switch PR: a `FROM` built from several `ARG`s, or an
     image name in a CI variable. Those consumers are listed in the inventory and moved by hand, and their new
     reference is written so that Renovate can read it (a literal `image:tag@sha256:digest`).
+- **Harbor project `base` is private.** Every reader logs in; nothing pulls `base` anonymously.
+  - **Clusters.** The node-level registry robots (`registries.yaml`, `robot$cluster-<cluster>`) get pull on `base`.
+    Manifests need no change for `base`. The per-namespace `harbor-pull` secret stays for the customer's own project
+    (§2).
+  - **CI pulls** (a `FROM base/...` in a build, a job image) use `HARBOR_PULL_USER` / `HARBOR_PULL_PASSWORD`, masked and
+    not protected, so branch and MR pipelines can build too:
+    - GitLab: group variables on each top-level group that builds images;
+    - GitHub: org secrets with the same names on each org that builds images.
+
+    A GitLab job whose own `image:` comes from `base` (the GitLab wrapper's `base/deployflow`, §8) also needs
+    `DOCKER_AUTH_CONFIG` for that registry, because the runner pulls the job image before any script runs.
+  - **The deployflow push robot needs pull on `base`.** `publish` runs `helm dependency build` against
+    `oci://<registry>/base/charts/app`, and the build pulls `base/*` images. One robot per customer
+    (`<customer>-push`) with push on its own project and pull on `base` is enough: the deployflow logs in once per
+    registry host (`skopeo login` and `helm registry login`), and that login covers every project the robot can read.
+    No second login is needed. This right is part of customer onboarding (§2).
+  - **Renovate** needs `hostRules` credentials for the registry host, also read-only on `base`. Without them Renovate
+    cannot read `base` tags or digests and stops offering base-image updates without an error in the PR list.
+  - **Robot tokens do not expire**, or they rotate with an alert before they do. An expired cluster robot shows up as
+    `ImagePullBackOff` on the next new node, long after the change that caused it.
 - **Pinning.** Services pin `tag@sha256:digest`.
 - **User.** Runtime images run as uid 1000.
 - **Tags.** `X.Y.Z` is immutable in harbor. Non-release artifacts are deleted after 30 days.
