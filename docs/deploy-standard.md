@@ -81,7 +81,7 @@ differ.
 | Thing | Name | Example (GCG) |
 |---|---|---|
 | Harbor project (images, `charts/`, edge artifacts) | `<customer>` | `gcg` (Connect included) |
-| Harbor robots | `<customer>-push` (CI), `<customer>-pull` (cluster) | `gcg-push`, `gcg-pull` |
+| Harbor robots | `<customer>-push` (CI; also pull on `base`, see §4), `<customer>-pull` (cluster) | `gcg-push`, `gcg-pull` |
 | Namespaces | `<customer>[-<product>]-<env>`, env `acc` or `prod` | `gcg-acc`, `gcg-connect-prod` |
 | Pull secret in every namespace | SopsSecret `harbor-pull` (from `<customer>-pull`) | |
 | Gitops repo | one per customer, `<customer>-gitops`, in the customer's GitHub org or GitLab group | `gcg-gitops-repo` (existing name stays) |
@@ -117,14 +117,90 @@ gwsn/<app>/environments/<env>/manifests/            # SopsSecret and other plain
 
 ## 4. Images
 
+Lead, 4 Nov 2026: "niet alle php images die de base images gebruiken is frankenphp, dat is dus de reden dat we
+base-images voor bizhost en gcg apart hebben gemaakt. we moeten dus apart franken-php-base maken naast php-base. dan
+is de base images op github geen issue maar houd er rekening mee dat we op veel repositories gebruik maken van bizhost
+base images! en dat ze ten alle tijden op arm en x64 moeten werken".
+
+Lead, 4 Nov 2026: "en vergeet renovate niet op de base images als je de repo veranderd dan moeten we dat ook mee nemen.
+de oude repo mag pas weg als niemand die base images meer gebruikt".
+
 - **One base-image source for the whole cluster.** The `base-images` repo (today
   `globalcontrolgroup/base-images`) moves to `bizhostbv/base-images` and pushes to harbor project `base`:
-  - `php-base` (FrankenPHP)
+  - `php-base`: plain PHP for the nginx + php-fpm case, **not** FrankenPHP. It takes over the role of the Bizhost
+    GitLab images `base-php-fpm-8x` / `php-fpm-prod-8x`: `php:8.x-fpm` on Debian (bookworm), with the extensions
+    those images carry today (exif, mbstring, pdo_mysql, intl, opcache, gd with freetype/jpeg, zip, soap, imagick,
+    igbinary, redis) and composer. Tooling that the current images bundle for convenience (Symfony CLI, sops, age,
+    editors) is not part of the base; an app that needs it adds it in its own Dockerfile.
+  - `frankenphp-base`: FrankenPHP, the current GCG image (`globalcontrolgroup/base-images`, today pushed as
+    `gcg/php-base`). Not every PHP application runs on FrankenPHP, which is why it is a separate image.
   - `node-base`
   - `nginx-base` (new)
 
-  All are Debian slim, built for amd64 and arm64, rebuilt weekly behind a Trivy gate. `bizhost/devops/base-images`
-  (GitLab) is retired.
+  Each image has one major per tag line (`php-base:8.4`, `frankenphp-base:8.4`, `node-base:22`), and the tag says what
+  the image runs: a `node-base:22` built from Node 26 is a defect. All are Debian based and rebuilt weekly behind a
+  Trivy gate.
+- **Every image is multi-arch, always.** The cluster runs amd64 and arm64 nodes, so every image (base images, app
+  images, tool images) is published as one tag over a manifest list with `linux/amd64` and `linux/arm64`. This is a
+  hard rule:
+  - each architecture is built natively on its own runner (§8), not under emulation;
+  - a build that does not produce both architectures is red, and its tag is not pushed;
+  - nothing inside an image may be architecture-specific by accident: binaries downloaded during the build pick the
+    file for the build's own architecture (`TARGETARCH` or `dpkg --print-architecture`), never a fixed `amd64`.
+- **Retiring the Bizhost GitLab base images is a migration, not a switch.** Many Bizhost repos build on the images from
+  `bizhost/hosting/base-images` (and the older `bizhost/devops/base-images`) on GitLab. They are retired in this
+  order, and not before:
+  1. **Inventory.** List every consumer (repo, file, image, tag) on GitLab and GitHub and keep the list with the
+     migration work.
+  2. **Keep building.** The old images stay built on their schedule and pullable, with their current names and tags,
+     until the last consumer has moved. No image is removed and no schedule is stopped while the list has an entry for
+     it.
+  3. **Move consumers.** Each consumer moves to the matching `base/*` image in its own change, through its normal
+     release (an acc deploy before prod).
+  4. **Retire.** Only when the inventory shows zero consumers: stop the schedule, archive the repo, and remove the
+     images after a grace period. Until then the old images keep being built on both architectures.
+
+  This holds for every old source: `bizhost/hosting/base-images` and `bizhost/devops/base-images` on GitLab, and
+  `globalcontrolgroup/base-images` with its `gcg/php-base` and `gcg/node-base` images on harbor.
+- **Renovate moves with the image.** A consumer must never stop getting base-image updates without anyone noticing.
+  - The change that moves an image to `registry.k8s-bizhost.nl/base/<image>` also changes the shared Renovate
+    preset(s) (§4.1), so Renovate keeps tracking the new path: the custom regex manager for digest pins outside a
+    `FROM` line, and the base-image `packageRules` (grouping, automerge, the cooldown of the §4.1 table).
+  - The same change adds a replacement rule (`replacementName`, plus `replacementVersion` where the tag scheme
+    changes) from each old image to its new one. Renovate then opens the switch PR in every consumer itself, with
+    the new image pinned on digest. A switch PR changes what runs, so it is a `fix(deps)` that releases to acc; it
+    does not automerge, a person merges it.
+  - A reference Renovate cannot read is not tracked and gets no switch PR: a `FROM` built from several `ARG`s, or an
+    image name in a CI variable. Those consumers are listed in the inventory and moved by hand, and their new
+    reference is written so that Renovate can read it (a literal `image:tag@sha256:digest`).
+- **Harbor project `base` is private.** Every reader logs in; nothing pulls `base` anonymously. Lead, 4 Nov 2026:
+  "ik ga hem alleen liever niet publiek maken", "graag en we moeten zorgen dat op gitlab op CI niveau
+  (gitlab.com/bizhost, gitlab.com/gwsn, gitlab.com/globalcontrolgroup) er group variable komen waar we de image pull
+  secret in hebben. het zelfde geld voor github. dan is de registry private en kunnen we er toch gemakkelijk bij" and
+  "met 50+ repo's is het anders te veel werk om handmatig users aan te maken".
+  - **Clusters.** The node-level registry robots (`registries.yaml`, `robot$cluster-<cluster>`) get pull on `base`.
+    Manifests need no change for `base`. The per-namespace `harbor-pull` secret stays for the customer's own project
+    (§2).
+  - **CI pulls** (a `FROM base/...` in a build, a job image) use `HARBOR_PULL_USER` / `HARBOR_PULL_PASSWORD`, masked and
+    not protected, so branch and MR pipelines can build too:
+    - GitLab: group variables on the top-level groups `bizhost`, `gwsn` and `globalcontrolgroup`;
+    - GitHub: org secrets with the same names on the orgs `bizhostbv`, `gwsn` and `globalcontrolgroup` (set by an org
+      admin).
+
+    One shared, read-only robot serves all of CI: either an existing group-level pull robot gets pull on `base`, or a
+    dedicated `robot$base+pull` replaces it. That choice is the lead's.
+
+    A GitLab job whose own `image:` comes from `base` (the GitLab wrapper's `base/deployflow`, §8) also needs
+    `DOCKER_AUTH_CONFIG` for that registry, because the runner pulls the job image before any script runs.
+  - **The deployflow push robot needs pull on `base`.** `publish` runs `helm dependency build` against
+    `oci://<registry>/base/charts/app`, and the build pulls `base/*` images. One robot per customer
+    (`<customer>-push`) with push on its own project and pull on `base` is enough: the deployflow logs in once per
+    registry host (`skopeo login` and `helm registry login`), and that login covers every project the robot can read.
+    No second login is needed. This right is part of customer onboarding (§2).
+  - **Renovate** needs `hostRules` credentials for the registry host, also read-only on `base`. Without them Renovate
+    cannot read `base` tags or digests and stops offering base-image updates without an error in the PR list.
+  - **Robot tokens do not expire**, or they rotate with an alert before they do. An expired cluster robot shows up as
+    `ImagePullBackOff` on the next new node, long after the change that caused it.
 - **Pinning.** Services pin `tag@sha256:digest`.
 - **User.** Runtime images run as uid 1000.
 - **Tags.** `X.Y.Z` is immutable in harbor. Non-release artifacts are deleted after 30 days.
