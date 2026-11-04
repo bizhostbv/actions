@@ -44,6 +44,9 @@ runners with the same labels, so callers need nothing organisation-specific:
 - `k8s-release.yml@v3` and `k8s-release-chart.yml@v3`: same inputs and secrets as before; only the
   image is now multi-arch. Migrating is changing `@v1`/`@v2` into `@v3`. `k8s-promote.yml` and
   `ci-checks.yml` are unchanged (promote already copies with `skopeo copy --all`).
+- `k8s-release.yml` (from v3.2.0): `harbor_username` and `harbor_token` are optional. Without them the
+  workflow uses the runner's own registry login, as `k8s-release-chart.yml` and `build-multiarch.yml`
+  already do. Callers on a runner without a login keep passing them.
 - `build-multiarch.yml@v3`: just build + push one multi-arch image, for images without a chart
   (base images, tools). Registry defaults to `registry.k8s-bizhost.nl`; pass `registry:
   harbor.k8s-hotel.nl` for Harbor.

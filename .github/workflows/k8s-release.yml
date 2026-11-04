@@ -20,8 +20,10 @@ on:
       tag_key:     { required: false, type: string, default: '.image.tag' }   # yq path to the image tag to set
     secrets:
       gitops_deploy_key: { required: true }
-      harbor_username:   { required: true }
-      harbor_token:      { required: true }
+      # Optional: without them every registry call uses the runner's own login (the harbor-builder
+      # runners on hotel log in at start). Pass them only on a runner that has no login.
+      harbor_username:   { required: false }
+      harbor_token:      { required: false }
 
 concurrency:
   group: release-${{ github.repository }}-${{ inputs.app }}   # per-app: matrix services coexist; same app serializes
@@ -58,7 +60,8 @@ jobs:
       - name: Guard — version must not already exist (immutable, no reuse)
         run: |
           set -euo pipefail
-          if skopeo inspect --creds "$HARBOR_USER:$HARBOR_TOKEN" "docker://${{ steps.ver.outputs.image }}" >/dev/null 2>&1; then
+          CREDS=(); [ -n "${HARBOR_USER:-}" ] && CREDS=(--creds "$HARBOR_USER:$HARBOR_TOKEN")
+          if skopeo inspect "${CREDS[@]}" "docker://${{ steps.ver.outputs.image }}" >/dev/null 2>&1; then
             echo "::error::${{ steps.ver.outputs.image }} already exists — versions are immutable. Bump the semver."; exit 1
           fi
 
@@ -104,7 +107,8 @@ jobs:
           # keeps (--preserve-digests), so the digest is known before it reaches the registry.
           OCI="$RUNNER_TEMP/oci-$ARCH"; rm -rf "$OCI"
           buildah push --digestfile "$RUNNER_TEMP/digest-$ARCH" "$IMG" "oci:$OCI:$ARCH"
-          skopeo copy --preserve-digests --dest-creds "$HARBOR_USER:$HARBOR_TOKEN" "oci:$OCI:$ARCH" "docker://$REPO@$(cat "$RUNNER_TEMP/digest-$ARCH")"
+          CREDS=(); [ -n "${HARBOR_USER:-}" ] && CREDS=(--dest-creds "$HARBOR_USER:$HARBOR_TOKEN")
+          skopeo copy --preserve-digests "${CREDS[@]}" "oci:$OCI:$ARCH" "docker://$REPO@$(cat "$RUNNER_TEMP/digest-$ARCH")"
           rm -rf "$OCI"
           echo "digest_$ARCH=$(cat "$RUNNER_TEMP/digest-$ARCH")" >> "$GITHUB_OUTPUT"
 
@@ -124,15 +128,16 @@ jobs:
         run: |
           set -euo pipefail
           LIST="release-$GITHUB_RUN_ID"
+          CREDS=(); [ -n "${HARBOR_USER:-}" ] && CREDS=(--creds "$HARBOR_USER:$HARBOR_TOKEN")
           buildah manifest rm "$LIST" >/dev/null 2>&1 || true
           buildah manifest create "$LIST" >/dev/null
           for DIGEST in "$DIGEST_AMD64" "$DIGEST_ARM64"; do
             [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::build did not hand over a digest (got '$DIGEST')"; exit 1; }
-            buildah manifest add --creds "$HARBOR_USER:$HARBOR_TOKEN" "$LIST" "docker://$REPO@$DIGEST" >/dev/null
+            buildah manifest add "${CREDS[@]}" "$LIST" "docker://$REPO@$DIGEST" >/dev/null
           done
-          buildah manifest push --all --creds "$HARBOR_USER:$HARBOR_TOKEN" "$LIST" "docker://$IMG"
+          buildah manifest push --all "${CREDS[@]}" "$LIST" "docker://$IMG"
           buildah manifest rm "$LIST" >/dev/null
-          PLATFORMS=$(skopeo inspect --raw --creds "$HARBOR_USER:$HARBOR_TOKEN" "docker://$IMG" | jq -r '[.manifests[].platform.architecture] | sort | join(",")')
+          PLATFORMS=$(skopeo inspect --raw "${CREDS[@]}" "docker://$IMG" | jq -r '[.manifests[].platform.architecture] | sort | join(",")')
           [ "$PLATFORMS" = "amd64,arm64" ] || { echo "::error::$IMG has '$PLATFORMS', expected amd64,arm64"; exit 1; }
 
       - name: Write immutable tag into GitOps (acc) — race-safe
