@@ -1,0 +1,7 @@
+image:
+  repository: harbor.example.com/app/web
+  tag: "1.2.3"
+readinessProbe:
+  httpGet: { path: /readyz, port: http }
+resources:
+  requests: { cpu: 50m, memory: 128Mi }

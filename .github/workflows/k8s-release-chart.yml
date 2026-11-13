@@ -1,0 +1,311 @@
+name: k8s-release-chart
+# Immutable, chart-aware release. Builds one immutable image :X.Y.Z AND packages the Helm
+# chart as an immutable OCI artifact vX.Y.Z (the image tag is baked into the chart), pushes
+# both to the acc registry, and bumps the acc ArgoCD Application's chart targetRevision in
+# the gitops repo. acc auto-syncs the new version. Pure-gitops: the running version == the
+# chart version (no moving tags, no mutable branch).
+#
+# Versioning (input `version_from`):
+#   branch       (default): caller pushes release/vX.Y.Z; the version comes from the branch.
+#   conventional          : caller pushes its default branch; the version is computed from
+#                           Conventional Commits since the last tag (feat->minor, fix->patch,
+#                           `type!:`/BREAKING->major; 0.x breaking->minor) and the new vX.Y.Z
+#                           tag is pushed with `tag_deploy_key`. A push with only chore/docs
+#                           commits releases nothing. This keeps the workflow at contents:read
+#                           (the deploy key, not the GITHUB_TOKEN, pushes the tag).
+#
+# Multi-arch (v3): the image is built natively for linux/amd64 and linux/arm64 and pushed as one
+# manifest list :X.Y.Z, so it runs on both node pools:
+#   version          [self-hosted, harbor-builder]        version, validation, immutability guard
+#   build (amd64)    [self-hosted, harbor-builder]        image by digest, untagged
+#   build (arm64)    [self-hosted, harbor-builder-arm64]  image by digest, untagged
+#   release          [self-hosted, harbor-builder]        manifest list :X.Y.Z, chart, gitops bump
+# :X.Y.Z is the only tag; each node pulls its own architecture from it. build-multiarch.yml builds
+# the same way; keep the "Build & push" steps of both in sync.
+#
+# Runner prerequisites (pre-stored on the self-hosted runners, never GITHUB_TOKEN), on both the
+# amd64 and the arm64 runners:
+#   - buildah login <registry>      (image push)
+#   - helm registry login <registry>  (OCI chart push)
+on:
+  workflow_call:
+    inputs:
+      project:      { required: true,  type: string }                                  # Harbor project (e.g. gcg)
+      app:          { required: true,  type: string }                                  # image + chart name (e.g. shop-backend)
+      dockerfile:   { required: false, type: string, default: Dockerfile }
+      context:      { required: false, type: string, default: . }
+      chart_dir:    { required: false, type: string, default: chart }
+      registry:     { required: false, type: string, default: harbor.k8s-hotel.nl }
+      gitops_repo:  { required: false, type: string, default: "git@github.com:globalcontrolgroup/gcg-shop-gitops.git" }
+      # The Application file in the gitops repo whose spec.sources[0].targetRevision is bumped.
+      # Default: apps/acc/<app>.yaml (the hotel layout). An application that lives on another
+      # cluster names its own file, e.g. gwsn/<app>/argocd/acceptance.yaml (15 September 2026).
+      gitops_app_file: { required: false, type: string, default: "" }
+      version_from: { required: false, type: string, default: branch }                 # 'branch' (release/vX.Y.Z) | 'conventional'
+    secrets:
+      gitops_deploy_key: { required: true }
+      tag_deploy_key:    { required: false }   # write deploy key on the CALLER's app repo; required when version_from == 'conventional' (pushes the computed vX.Y.Z tag)
+      npm_token:         { required: false }   # read token for a private package registry; mounted into the build as the `npm_token` secret (the Dockerfile uses --mount=type=secret,id=npm_token). Omit if the build needs no registry auth.
+
+concurrency:
+  group: release-${{ github.repository }}   # one release at a time per app repo
+  cancel-in-progress: false                 # queue releases; never drop one
+
+# checkout needs contents:read to clone this (private) repo via GITHUB_TOKEN;
+# everything else (registry push, gitops push) uses host creds + the deploy key.
+#
+# No packages:read here on purpose (removed 18 September 2026): a workflow_call's permissions
+# block cannot exceed what the CALLER grants, so a caller whose own job only sets
+# `permissions: contents: read` — every caller who never touched this, i.e. most of them —
+# got a startup_failure the moment this workflow asked for packages:read too. A caller that
+# wants the npm_token GITHUB_TOKEN-fallback below (see NPM_TOKEN) grants packages:read itself,
+# on its own calling job, exactly like an explicit npm_token secret is its own opt-in.
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: [self-hosted, harbor-builder]
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      released: ${{ steps.ver.outputs.released }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # full history + tags ONLY for conventional versioning; branch mode keeps the
+          # shallow checkout.
+          fetch-depth: ${{ inputs.version_from == 'conventional' && '0' || '1' }}
+
+      - name: Derive & validate version
+        id: ver
+        env:
+          REF: ${{ github.ref }}
+          VERSION_FROM: ${{ inputs.version_from }}
+          TAG_KEY: ${{ secrets.tag_deploy_key }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          case "$VERSION_FROM" in
+            branch)
+              v="${REF#refs/heads/release/v}"
+              printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+                || { echo "::error::version_from=branch needs a release/vMAJOR.MINOR.PATCH branch (got '$REF')"; exit 1; }
+              echo "version=$v" >> "$GITHUB_OUTPUT"
+              echo "released=true" >> "$GITHUB_OUTPUT"
+              ;;
+            conventional)
+              [ -n "$TAG_KEY" ] || { echo "::error::version_from=conventional requires the tag_deploy_key secret (write deploy key on the app repo)"; exit 1; }
+              git fetch --tags --force >/dev/null 2>&1 || true
+              LATEST=$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)
+              if [ -z "$LATEST" ]; then BASE="v0.0.0"; RANGE="HEAD"; else BASE="$LATEST"; RANGE="${LATEST}..HEAD"; fi
+              SUBJECTS=$(git log "$RANGE" --no-merges --format='%s' || true)
+              BODIES=$(git log "$RANGE" --no-merges --format='%b' || true)
+              BUMP="none"
+              if echo "$SUBJECTS" | grep -qE '^[a-zA-Z]+(\([^)]*\))?!:' || echo "$BODIES" | grep -qE 'BREAKING[ -]CHANGE'; then BUMP="major"
+              elif echo "$SUBJECTS" | grep -qE '^feat(\([^)]*\))?:'; then BUMP="minor"
+              elif echo "$SUBJECTS" | grep -qE '^fix(\([^)]*\))?:'; then BUMP="patch"
+              fi
+              if [ "$BUMP" = "none" ]; then
+                echo "No feat/fix/breaking commits since ${BASE} — no release." | tee -a "$GITHUB_STEP_SUMMARY"
+                echo "released=false" >> "$GITHUB_OUTPUT"; exit 0
+              fi
+              V="${BASE#v}"; MAJ="${V%%.*}"; REST="${V#*.}"; MIN="${REST%%.*}"; PAT="${REST##*.}"
+              # 0.x: a breaking change bumps MINOR, not MAJOR (avoid a premature 1.0)
+              { [ "$BUMP" = "major" ] && [ "$MAJ" -eq 0 ]; } && BUMP="minor" || true
+              case "$BUMP" in
+                major) MAJ=$((MAJ+1)); MIN=0; PAT=0;;
+                minor) MIN=$((MIN+1)); PAT=0;;
+                patch) PAT=$((PAT+1));;
+              esac
+              NEW="${MAJ}.${MIN}.${PAT}"
+              # Push the tag with the deploy key so the workflow stays contents:read. Pin
+              # github.com's host key (no TOFU) since this push carries a deploy key.
+              trap 'rm -f /tmp/tag-ci /tmp/tag-known' EXIT
+              printf '%s\n' "$TAG_KEY" > /tmp/tag-ci && chmod 600 /tmp/tag-ci
+              printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > /tmp/tag-known
+              export GIT_SSH_COMMAND="ssh -i /tmp/tag-ci -o IdentitiesOnly=yes -o UserKnownHostsFile=/tmp/tag-known -o StrictHostKeyChecking=yes"
+              git config user.name 'gitops-ci'; git config user.email 'gitops-ci@k8s-hotel'
+              git tag -a "v${NEW}" -m "release v${NEW}"
+              git push "git@github.com:${REPO}.git" "v${NEW}"
+              echo "version=${NEW}" >> "$GITHUB_OUTPUT"
+              echo "released=true" >> "$GITHUB_OUTPUT"
+              echo "Conventional release v${NEW} (${BUMP} from ${BASE})" | tee -a "$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              echo "::error::version_from must be 'branch' or 'conventional' (got '$VERSION_FROM')"; exit 1
+              ;;
+          esac
+
+      - name: Validate project/app (charset — they land in registry refs and file paths)
+        if: steps.ver.outputs.released == 'true'
+        env:
+          PROJECT: ${{ inputs.project }}
+          APP: ${{ inputs.app }}
+        run: |
+          set -euo pipefail
+          for name in PROJECT APP; do
+            val="${!name}"
+            printf '%s' "$val" | grep -Eq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$' \
+              || { echo "::error::$name must match ^[a-z0-9-]+$ (got '$val')"; exit 1; }
+          done
+
+      - name: Guard — image & chart must not already exist (immutable, no reuse)
+        if: steps.ver.outputs.released == 'true'
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          PROJECT: ${{ inputs.project }}
+          APP: ${{ inputs.app }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          if skopeo inspect "docker://$REGISTRY/$PROJECT/$APP:$VERSION" >/dev/null 2>&1; then
+            echo "::error::image $REGISTRY/$PROJECT/$APP:$VERSION already exists — versions are immutable. Bump the semver."; exit 1
+          fi
+          if skopeo inspect "docker://$REGISTRY/$PROJECT/charts/$APP:$VERSION" >/dev/null 2>&1; then
+            echo "::error::chart $REGISTRY/$PROJECT/charts/$APP:$VERSION already exists — versions are immutable. Bump the semver."; exit 1
+          fi
+
+  build:
+    needs: version
+    if: needs.version.outputs.released == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { arch: amd64, runner: harbor-builder }
+          - { arch: arm64, runner: harbor-builder-arm64 }
+    runs-on: [self-hosted, "${{ matrix.runner }}"]
+    # The digest is the only handle on the untagged half. Each leg sets only its own output
+    # name, and GitHub combines the outputs of all matrix legs, so the next job sees both.
+    # Job outputs, not artifacts: they belong to this call of the workflow (a caller with a
+    # matrix of services cannot mix them up) and they do not count against artifact storage.
+    outputs:
+      digest_amd64: ${{ steps.push.outputs.digest_amd64 }}
+      digest_arm64: ${{ steps.push.outputs.digest_arm64 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build & push ${{ matrix.arch }} image
+        id: push
+        env:
+          ARCH: ${{ matrix.arch }}
+          REGISTRY: ${{ inputs.registry }}
+          PROJECT: ${{ inputs.project }}
+          APP: ${{ inputs.app }}
+          VERSION: ${{ needs.version.outputs.version }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          CONTEXT: ${{ inputs.context }}
+          # Use an explicit npm_token if the caller passes one, else fall back to the
+          # workflow's own GITHUB_TOKEN (packages:read) — so a caller can install a private
+          # GitHub Packages dep without minting/passing a PAT. (GITHUB_TOKEN is reserved and
+          # cannot be passed by a caller as a secret, so the fallback is resolved here.)
+          NPM_TOKEN: ${{ secrets.npm_token || github.token }}
+        run: |
+          set -euo pipefail
+          IMG="localhost/build:$ARCH"
+          # Optionally expose a registry read-token to the build as the `npm_token`
+          # secret (Dockerfile: --mount=type=secret,id=npm_token).
+          SECRET_ARGS=()
+          if [ -n "${NPM_TOKEN:-}" ]; then
+            trap 'rm -f /tmp/npm_token' EXIT
+            install -m600 /dev/null /tmp/npm_token
+            printf '%s' "$NPM_TOKEN" > /tmp/npm_token
+            SECRET_ARGS=(--secret "id=npm_token,src=/tmp/npm_token")
+          fi
+          # Build metadata for the image's version endpoint. A Dockerfile that declares
+          # these ARGs gets them; one that does not only sees a buildah warning about an
+          # unused build arg.
+          BUILD_META_ARGS=(
+            --build-arg "APP_BUILD_SHA=${GITHUB_SHA}"
+            --build-arg "APP_BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            --build-arg "APP_BUILD_VERSION=${VERSION}"
+          )
+          buildah bud --layers --isolation chroot --ulimit nofile=65536:65536 "${SECRET_ARGS[@]}" "${BUILD_META_ARGS[@]}" -f "$DOCKERFILE" -t "$IMG" "$CONTEXT"
+          # A runner on the wrong architecture would silently push a mislabelled image.
+          GOT=$(buildah inspect --format '{{.OCIv1.Architecture}}' "$IMG")
+          [ "$GOT" = "$ARCH" ] || { echo "::error::built $GOT on the $ARCH runner"; exit 1; }
+          # Push by digest, without a tag: through an OCI layout, whose manifest digest skopeo
+          # keeps (--preserve-digests), so the digest is known before it reaches the registry.
+          OCI="$RUNNER_TEMP/oci-$ARCH"; rm -rf "$OCI"
+          buildah push --digestfile "$RUNNER_TEMP/digest-$ARCH" "$IMG" "oci:$OCI:$ARCH"
+          skopeo copy --preserve-digests "oci:$OCI:$ARCH" "docker://$REGISTRY/$PROJECT/$APP@$(cat "$RUNNER_TEMP/digest-$ARCH")"   # registry creds pre-stored on the runner
+          rm -rf "$OCI"
+          echo "digest_$ARCH=$(cat "$RUNNER_TEMP/digest-$ARCH")" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: [version, build]
+    runs-on: [self-hosted, harbor-builder]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Join amd64 + arm64 into the immutable multi-arch image
+        env:
+          DIGEST_AMD64: ${{ needs.build.outputs.digest_amd64 }}
+          DIGEST_ARM64: ${{ needs.build.outputs.digest_arm64 }}
+          REGISTRY: ${{ inputs.registry }}
+          PROJECT: ${{ inputs.project }}
+          APP: ${{ inputs.app }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          IMG="$REGISTRY/$PROJECT/$APP:$VERSION"
+          LIST="release-$GITHUB_RUN_ID"
+          buildah manifest rm "$LIST" >/dev/null 2>&1 || true
+          buildah manifest create "$LIST" >/dev/null
+          for DIGEST in "$DIGEST_AMD64" "$DIGEST_ARM64"; do
+            [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::build did not hand over a digest (got '$DIGEST')"; exit 1; }
+            buildah manifest add "$LIST" "docker://$REGISTRY/$PROJECT/$APP@$DIGEST" >/dev/null
+          done
+          buildah manifest push --all "$LIST" "docker://$IMG"   # registry creds pre-stored on the runner
+          buildah manifest rm "$LIST" >/dev/null
+          PLATFORMS=$(skopeo inspect --raw "docker://$IMG" | jq -r '[.manifests[].platform.architecture] | sort | join(",")')
+          [ "$PLATFORMS" = "amd64,arm64" ] || { echo "::error::$IMG has '$PLATFORMS', expected amd64,arm64"; exit 1; }
+
+      - name: Package & push immutable chart (image tag baked in)
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          PROJECT: ${{ inputs.project }}
+          APP: ${{ inputs.app }}
+          VERSION: ${{ needs.version.outputs.version }}
+          CHART_DIR: ${{ inputs.chart_dir }}
+        run: |
+          set -euo pipefail
+          # Bake the image tag into the chart so the chart version fully determines the
+          # running image. The chart name in Chart.yaml MUST equal "$APP".
+          yq -i ".image.tag = \"$VERSION\"" "$CHART_DIR/values.yaml"
+          rm -rf /tmp/chartpkg && mkdir -p /tmp/chartpkg
+          helm package "$CHART_DIR" --version "$VERSION" --app-version "$VERSION" -d /tmp/chartpkg
+          helm push "/tmp/chartpkg/$APP-$VERSION.tgz" "oci://$REGISTRY/$PROJECT/charts"   # helm registry login pre-stored on host
+
+      - name: Bump acc Application chart targetRevision in gitops (acc auto-syncs)
+        env:
+          GIT_SSH_COMMAND: ssh -i /tmp/gitops-ci -o IdentitiesOnly=yes -o UserKnownHostsFile=/tmp/gitops-known_hosts -o StrictHostKeyChecking=yes
+          VERSION: ${{ needs.version.outputs.version }}
+          APP: ${{ inputs.app }}
+          GITOPS_REPO: ${{ inputs.gitops_repo }}
+          GITOPS_APP_FILE: ${{ inputs.gitops_app_file }}
+          GITOPS_KEY: ${{ secrets.gitops_deploy_key }}
+        run: |
+          set -euo pipefail
+          trap 'rm -f /tmp/gitops-ci /tmp/gitops-known_hosts' EXIT
+          printf '%s\n' "$GITOPS_KEY" > /tmp/gitops-ci && chmod 600 /tmp/gitops-ci
+          # Pin github.com's published Ed25519 host key instead of TOFU (accept-new),
+          # closing the first-connection MITM window on a push that carries the deploy key.
+          printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > /tmp/gitops-known_hosts
+          rm -rf /tmp/gitops && git clone "$GITOPS_REPO" /tmp/gitops
+          FILE="${GITOPS_APP_FILE:-apps/acc/$APP.yaml}"
+          test -f "/tmp/gitops/$FILE" || { echo "::error::$FILE does not exist in $GITOPS_REPO — pass gitops_app_file for an application that does not live under apps/acc/"; exit 1; }
+          yq -i ".spec.sources[0].targetRevision = \"$VERSION\"" "/tmp/gitops/$FILE"
+          git -C /tmp/gitops config user.name 'gitops-ci'
+          git -C /tmp/gitops config user.email 'gitops-ci@k8s-hotel'
+          if [ -z "$GITOPS_APP_FILE" ]; then MSG="release(acc/$APP): chart $VERSION"; else MSG="release($APP): chart $VERSION in $FILE"; fi
+          git -C /tmp/gitops commit -am "$MSG"
+          git -C /tmp/gitops push
+
+      - name: Summary
+        env:
+          APP: ${{ inputs.app }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          echo "Released image + chart $APP:$VERSION -> acc (auto-sync)." >> "$GITHUB_STEP_SUMMARY"
+          echo "Promote to prod with the k8s-promote workflow + gitops PR + manual Sync." >> "$GITHUB_STEP_SUMMARY"

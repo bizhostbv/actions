@@ -1,0 +1,185 @@
+name: deploy
+# Shared deploy pipeline (deployflow): version -> build (amd64 + arm64) -> publish -> gitops acc.
+# Runs on a push to the default branch. A step only runs when the previous one succeeded and the
+# commits since the last tag are releasable. The git tag is pushed only after image and chart are
+# in the registry, so a failed build never burns a version. Production: release-production.yml.
+#
+# Caller:
+#   jobs:
+#     deploy:
+#       uses: bizhostbv/actions/.github/workflows/deploy.yml@<release tag>
+#       with: { project: myproject, app: myapp, gitops_repo: myorg/my-gitops, gitops_acc_file: apps/myapp/acceptance.yaml }
+#       secrets: { app_id: "${{ secrets.DEPLOYFLOW_APP_ID }}", app_private_key: "${{ secrets.DEPLOYFLOW_APP_PRIVATE_KEY }}" }
+#
+# The GitHub App "deployflow" must be installed on the app repo (contents: write) and the gitops
+# repo (contents: write). Runner prerequisites as in k8s-release-chart.yml (registry login stored on host).
+on:
+  workflow_call:
+    inputs:
+      project:         { required: true,  type: string }
+      app:             { required: true,  type: string }
+      registry:        { required: false, type: string, default: registry.k8s-bizhost.nl }
+      dockerfile:      { required: false, type: string, default: Dockerfile }
+      context:         { required: false, type: string, default: . }
+      chart_dir:       { required: false, type: string, default: chart }
+      gitops_repo:     { required: true,  type: string }   # owner/name on GitHub
+      gitops_acc_file: { required: true,  type: string }   # Application file whose spec.sources[0].targetRevision is bumped
+    secrets:
+      app_id:          { required: true }
+      app_private_key: { required: true }
+      npm_token:       { required: false }                 # mounted as build secret id=npm_token
+
+env:
+  # Where the deployflow scripts come from. Releases of this repo pin it to their own release tag.
+  DEPLOYFLOW_REF: v3.1.2 # must equal the release tag; bump it in the release PR
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: [self-hosted, harbor-builder]
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      released: ${{ steps.ver.outputs.released }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bizhostbv/actions
+          ref: ${{ env.DEPLOYFLOW_REF }}
+          path: .deployflow-src
+          sparse-checkout: deployflow
+      - name: Compute version
+        id: ver
+        run: DEPLOYFLOW_OUTPUT="$GITHUB_OUTPUT" .deployflow-src/deployflow/bin/deployflow version
+      - name: Guard, image and chart must not exist yet
+        if: steps.ver.outputs.released == 'true'
+        env:
+          PROJECT: ${{ inputs.project }}
+          APP: ${{ inputs.app }}
+          REGISTRY: ${{ inputs.registry }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: .deployflow-src/deployflow/bin/deployflow guard-immutable
+
+  build:
+    needs: version
+    if: needs.version.outputs.released == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { arch: amd64, runner: harbor-builder }
+          - { arch: arm64, runner: harbor-builder-arm64 }
+    runs-on: [self-hosted, "${{ matrix.runner }}"]
+    # Each leg writes only its own digest_<arch>; GitHub merges the outputs of the legs.
+    outputs:
+      digest_amd64: ${{ steps.build.outputs.digest_amd64 }}
+      digest_arm64: ${{ steps.build.outputs.digest_arm64 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bizhostbv/actions
+          ref: ${{ env.DEPLOYFLOW_REF }}
+          path: .deployflow-src
+          sparse-checkout: deployflow
+      - name: Build and push ${{ matrix.arch }} by digest
+        id: build
+        env:
+          ARCH: ${{ matrix.arch }}
+          PROJECT: ${{ inputs.project }}
+          APP: ${{ inputs.app }}
+          REGISTRY: ${{ inputs.registry }}
+          VERSION: ${{ needs.version.outputs.version }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          CONTEXT: ${{ inputs.context }}
+          GIT_SHA: ${{ github.sha }}
+          NPM_TOKEN: ${{ secrets.npm_token || github.token }}
+        run: DEPLOYFLOW_OUTPUT="$GITHUB_OUTPUT" .deployflow-src/deployflow/bin/deployflow build
+
+  publish:
+    needs: [version, build]
+    runs-on: [self-hosted, harbor-builder]
+    steps:
+      - name: App token
+        id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ secrets.app_id }}
+          private-key: ${{ secrets.app_private_key }}
+          repositories: ${{ github.event.repository.name }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ steps.app.outputs.token }}   # also used by push-tag below
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bizhostbv/actions
+          ref: ${{ env.DEPLOYFLOW_REF }}
+          path: .deployflow-src
+          sparse-checkout: deployflow
+          persist-credentials: false
+      - name: Join manifest list, package and push chart
+        env:
+          PROJECT: ${{ inputs.project }}
+          APP: ${{ inputs.app }}
+          REGISTRY: ${{ inputs.registry }}
+          VERSION: ${{ needs.version.outputs.version }}
+          CHART_DIR: ${{ inputs.chart_dir }}
+          DIGEST_AMD64: ${{ needs.build.outputs.digest_amd64 }}
+          DIGEST_ARM64: ${{ needs.build.outputs.digest_arm64 }}
+        run: .deployflow-src/deployflow/bin/deployflow publish
+      - name: Push the git tag
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: .deployflow-src/deployflow/bin/deployflow push-tag
+
+  gitops-acc:
+    needs: [version, publish]
+    runs-on: [self-hosted, harbor-builder]
+    steps:
+      - name: Split gitops repo slug
+        id: g
+        env:
+          SLUG: ${{ inputs.gitops_repo }}
+        run: |
+          set -euo pipefail
+          [[ $SLUG =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "::error::gitops_repo must be owner/name"; exit 1; }
+          echo "owner=${SLUG%%/*}" >> "$GITHUB_OUTPUT"
+          echo "name=${SLUG#*/}" >> "$GITHUB_OUTPUT"
+      - name: App token
+        id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ secrets.app_id }}
+          private-key: ${{ secrets.app_private_key }}
+          owner: ${{ steps.g.outputs.owner }}
+          repositories: ${{ steps.g.outputs.name }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bizhostbv/actions
+          ref: ${{ env.DEPLOYFLOW_REF }}
+          path: .deployflow-src
+          sparse-checkout: deployflow
+          persist-credentials: false
+      - name: Bump acceptance in gitops
+        env:
+          TOKEN: ${{ steps.app.outputs.token }}
+          APP: ${{ inputs.app }}
+          VERSION: ${{ needs.version.outputs.version }}
+          GITOPS_REPO: https://github.com/${{ inputs.gitops_repo }}.git
+          GITOPS_ACC_FILE: ${{ inputs.gitops_acc_file }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          set +x
+          AUTH=$(printf 'x-access-token:%s' "$TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::$AUTH"
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader "GIT_CONFIG_VALUE_0=Authorization: Basic $AUTH"
+          .deployflow-src/deployflow/bin/deployflow gitops-acc

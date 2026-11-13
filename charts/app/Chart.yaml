@@ -1,0 +1,5 @@
+apiVersion: v2
+name: app
+description: Shared library chart that renders the standard resources of an app (Deployment, Service, Ingress, HPA/KEDA, PDB, VMServiceScrape, ServiceAccount).
+type: library
+version: 1.0.0

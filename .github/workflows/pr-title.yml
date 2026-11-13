@@ -1,0 +1,31 @@
+name: pr-title
+# Fails a pull request whose title is not a conventional commit (feat|fix|chore|...). PRs are
+# squash-merged, so the title becomes the commit subject that decides the next version.
+#
+# Caller:
+#   on: { pull_request: { types: [opened, edited, synchronize, reopened] } }
+#   jobs: { title: { uses: bizhostbv/actions/.github/workflows/pr-title.yml@<release tag> } }
+on:
+  workflow_call:
+
+env:
+  # Releases of this repo pin it to their own release tag.
+  DEPLOYFLOW_REF: v3.1.2 # must equal the release tag; bump it in the release PR
+
+permissions:
+  contents: read
+
+jobs:
+  title:
+    runs-on: [self-hosted, harbor-builder]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bizhostbv/actions
+          ref: ${{ env.DEPLOYFLOW_REF }}
+          sparse-checkout: deployflow
+          persist-credentials: false
+      - name: Check title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: deployflow/bin/deployflow check-title

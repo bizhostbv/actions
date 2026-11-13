@@ -1,0 +1,93 @@
+name: release-production
+# The production button. The caller exposes it as a workflow_dispatch with an optional `rollback`
+# input and passes that input on. Version is never typed in: it is the acceptance targetRevision,
+# unless `rollback` names a former production version. Guards (member of release-admins, artifacts
+# exist, direction) are in `deployflow release-prod`.
+#
+# Caller:
+#   on: { workflow_dispatch: { inputs: { rollback: { description: "Former prod version to roll back to (empty = release acc)", required: false, default: "" } } } }
+#   jobs:
+#     production:
+#       uses: bizhostbv/actions/.github/workflows/release-production.yml@<release tag>
+#       with: { project: myproject, app: myapp, gitops_repo: myorg/my-gitops, gitops_acc_file: ..., gitops_prod_file: ..., rollback: "${{ inputs.rollback }}" }
+#       secrets: { app_id: ..., app_private_key: ... }
+#
+# The App needs contents: write on the gitops repo and Members: read on the org (team membership).
+on:
+  workflow_call:
+    inputs:
+      project:          { required: true,  type: string }
+      app:              { required: true,  type: string }
+      registry:         { required: false, type: string, default: registry.k8s-bizhost.nl }
+      gitops_repo:      { required: true,  type: string }
+      gitops_acc_file:  { required: true,  type: string }
+      gitops_prod_file: { required: true,  type: string }
+      rollback:         { required: false, type: string, default: "" }
+    secrets:
+      app_id:          { required: true }
+      app_private_key: { required: true }
+
+env:
+  # Releases of this repo pin it to their own release tag.
+  DEPLOYFLOW_REF: v3.1.2 # must equal the release tag; bump it in the release PR
+
+concurrency:
+  group: release-production-${{ github.repository }}-${{ inputs.app }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, harbor-builder]
+    steps:
+      - name: Split gitops repo slug
+        id: g
+        env:
+          SLUG: ${{ inputs.gitops_repo }}
+        run: |
+          set -euo pipefail
+          [[ $SLUG =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "::error::gitops_repo must be owner/name"; exit 1; }
+          echo "owner=${SLUG%%/*}" >> "$GITHUB_OUTPUT"
+          echo "name=${SLUG#*/}" >> "$GITHUB_OUTPUT"
+      - name: App token
+        id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ secrets.app_id }}
+          private-key: ${{ secrets.app_private_key }}
+          owner: ${{ steps.g.outputs.owner }}
+          repositories: ${{ steps.g.outputs.name }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bizhostbv/actions
+          ref: ${{ env.DEPLOYFLOW_REF }}
+          path: .deployflow-src
+          sparse-checkout: deployflow
+          persist-credentials: false
+      - name: Release to production
+        env:
+          TOKEN: ${{ steps.app.outputs.token }}
+          DEPLOYFLOW_PROVIDER: github
+          ORG: ${{ github.repository_owner }}
+          # triggering_actor: on a re-run this is the person re-running, not the original clicker
+          ACTOR: ${{ github.triggering_actor }}
+          API_TOKEN: ${{ steps.app.outputs.token }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          PROJECT: ${{ inputs.project }}
+          APP: ${{ inputs.app }}
+          REGISTRY: ${{ inputs.registry }}
+          ROLLBACK: ${{ inputs.rollback }}
+          GITOPS_REPO: https://github.com/${{ inputs.gitops_repo }}.git
+          GITOPS_ACC_FILE: ${{ inputs.gitops_acc_file }}
+          GITOPS_PROD_FILE: ${{ inputs.gitops_prod_file }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          set +x
+          AUTH=$(printf 'x-access-token:%s' "$TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::$AUTH"
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader "GIT_CONFIG_VALUE_0=Authorization: Basic $AUTH"
+          .deployflow-src/deployflow/bin/deployflow release-prod
