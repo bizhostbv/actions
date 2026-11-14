@@ -28,8 +28,8 @@ repo holds the values. For a chart-based release see [k8s-release-chart](k8s-rel
 | Name | Required | Meaning |
 |---|---|---|
 | `gitops_deploy_key` | yes | SSH deploy key with write access to the gitops repo |
-| `harbor_username` | yes | Registry robot user |
-| `harbor_token` | yes | Registry robot token |
+| `harbor_username` | no | Registry robot user. Without it, every registry call uses the runner's own login |
+| `harbor_token` | no | Registry robot token. Pass both only on a runner without a registry login |
 
 ## Outputs
 
