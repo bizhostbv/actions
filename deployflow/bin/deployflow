@@ -169,15 +169,23 @@ cmd_build() {
 cmd_publish() {
   valid PROJECT "$NAME_RE"; valid APP "$NAME_RE"; valid VERSION "$VER_RE"; need REGISTRY CHART_DIR DIGEST_AMD64 DIGEST_ARM64
   registry_login
-  local img="$REGISTRY/$PROJECT/$APP:$VERSION" list="deployflow-$APP-$VERSION" d platforms chart="$TMP/chart"
+  local img="$REGISTRY/$PROJECT/$APP:$VERSION" list="deployflow-$APP-$VERSION" arch var d got platforms chart="$TMP/chart"
+  # Both architectures are checked before the tag exists (deploy standard §4): a missing or wrong one pushes no tag.
+  for arch in amd64 arm64; do
+    var=DIGEST_$(printf %s $arch | tr a-z A-Z); d=${!var}
+    [[ $d =~ ^sha256:[0-9a-f]{64}$ ]] || die "not a digest: '$d'"
+    got=$(skopeo inspect "docker://$REGISTRY/$PROJECT/$APP@$d" | jq -r '.Architecture // empty') ||
+      die "$REGISTRY/$PROJECT/$APP@$d not found"
+    [ "$got" = $arch ] || die "$var is '${got:-unknown}', expected $arch; no tag pushed"
+  done
   buildah manifest rm "$list" >/dev/null 2>&1 || true
   buildah manifest create "$list" >/dev/null
   for d in "$DIGEST_AMD64" "$DIGEST_ARM64"; do
-    [[ $d =~ ^sha256:[0-9a-f]{64}$ ]] || die "not a digest: '$d'"
     buildah manifest add "$list" "docker://$REGISTRY/$PROJECT/$APP@$d" >/dev/null
   done
   buildah manifest push --all "$list" "docker://$img"
   buildah manifest rm "$list" >/dev/null
+  # and once more on what the registry now serves under the tag
   platforms=$(skopeo inspect --raw "docker://$img" | jq -r '[.manifests[].platform.architecture] | sort | join(",")')
   [ "$platforms" = "amd64,arm64" ] || die "$img has '$platforms', expected amd64,arm64"
   # bake the image tag into a temp copy of the chart: chart version == running image

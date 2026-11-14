@@ -272,7 +272,7 @@ gitops repo and the tag push is set up by the wrapper, never by the script.
 | `check-title` | Fails unless `$TITLE` is a conventional commit title |
 | `guard-immutable` | Fails if image or chart `$VERSION` already exists in the registry |
 | `build` | Builds one `$ARCH` with buildah, checks the architecture, pushes by digest, writes `digest_<arch>=` |
-| `publish` | Joins both digests into the manifest list `:$VERSION`, packages the chart with `image.tag=$VERSION` (runs `helm dependency build` when the chart has dependencies), pushes it |
+| `publish` | Checks that each digest exists and has the expected architecture (amd64, arm64) before any tag is pushed, joins both digests into the manifest list `:$VERSION`, checks the platforms the registry now serves under the tag, packages the chart with `image.tag=$VERSION` (runs `helm dependency build` when the chart has dependencies), pushes it |
 | `gitops-acc` | Sets `targetRevision` in `$GITOPS_ACC_FILE`; skips (exit 0) when acceptance is already at or past `$VERSION`. Retries a rejected push up to 3 times with a rebase |
 | `release-prod` | Guards: the actor is a member of `release-admins`; version is the acceptance `targetRevision` (or `$ROLLBACK`, which must be a former production version); image and chart exist; direction is forward (backward for a rollback). Then commits to `$GITOPS_PROD_FILE` |
 
